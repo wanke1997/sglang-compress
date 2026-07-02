@@ -1,3 +1,57 @@
+<div align="center">
+
+# SGLang + R-KV — Decoding-Time KV Cache Compression
+
+</div>
+
+**This repository is a fork of [SGLang](https://github.com/sgl-project/sglang)
+(v0.5.14) that adds R-KV**, a *redundancy-aware KV-cache compressor*. While a
+model generates a long output, R-KV periodically evicts the **unimportant** and
+**redundant** past tokens, keeping only a fixed `budget` of KV entries per
+request — **freeing GPU memory while preserving generation quality**.
+
+- **Algorithm** — joint scoring of *importance* (attention over a recent
+  observation window) and *redundancy* (key cosine-similarity); keep the top
+  `budget` tokens per request.
+- **Integration** — true physical eviction in SGLang's paged KV pool: relocate
+  surviving slots, `free()` the rest, rewrite `req_to_token`, and keep rotary
+  positions consistent after the sequence physically shrinks. Runs on the
+  FlashInfer decode path.
+- **Code & docs** —
+  [`python/sglang/srt/mem_cache/rkv/`](python/sglang/srt/mem_cache/rkv/)
+  (`algo.py`, `integration.py`, `DESIGN.md`, `IMPLEMENTATION.md`).
+
+## Headline result — Qwen2.5-Math-7B-Instruct (single NVIDIA H100)
+
+GSM8K-style math harness, 20 items, few-shot prompt ≈700 tokens.
+**R-KV keeps full accuracy while running hundreds of physical KV compactions:**
+
+| Config | Accuracy | KV compactions | Notes |
+| --- | --- | --- | --- |
+| baseline (R-KV off) | 95% | — | reference |
+| **R-KV, budget=512** | **100%** | 184 | lossless — even though `budget < prompt`, so R-KV also evicts part of the prompt |
+| R-KV, budget=256 | 90% | 241 | most aggressive; slight drop |
+
+The server ran **184–241 physical compactions with zero crashes**. Full report:
+[`rkv-benchmark/RESULTS_math7b.md`](rkv-benchmark/RESULTS_math7b.md).
+
+## Quick start
+
+```bash
+cd rkv-benchmark
+./prepare_data.sh                                                     # fetch the eval set
+MODEL=/path/to/Qwen2.5-Math-7B-Instruct ./launch_server.sh rkv 512    # start server (R-KV on)
+python3 eval.py --n 20 --label rkv_b512                               # run eval in another shell
+```
+
+R-KV requires the eager decode path and the prefix cache **off**; `launch_server.sh`
+sets the required flags (`--disable-radix-cache --disable-decode-cuda-graph
+--disable-overlap-schedule --page-size 1`). See
+[`rkv-benchmark/README.md`](rkv-benchmark/README.md) for details and
+[`RESULTS.md`](rkv-benchmark/RESULTS.md) for the 0.5B sanity check.
+
+---
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
