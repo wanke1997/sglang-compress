@@ -406,7 +406,7 @@ class RKVCompressor:
             state.req.kv_allocated_len = budget
         self.pending_length_updates[idx] = budget
 
-        logger.debug(
+        logger.info(
             "R-KV compacted req_pool_idx=%d: phys %d -> %d slots (freed %d)",
             idx,
             seq_len,
