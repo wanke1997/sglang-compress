@@ -55,6 +55,10 @@ sets the required flags (`--disable-radix-cache --disable-decode-cuda-graph
 [`R-KV/benchmark/README.md`](R-KV/benchmark/README.md) for details and
 [`R-KV/benchmark/RESULTS.md`](R-KV/benchmark/RESULTS.md) for the 0.5B sanity check.
 
+For multi-GPU **data-parallel** serving (`DP=N ./launch_server.sh rkv 512`),
+throughput scales up to **5.2× on 8× H100** with unchanged accuracy — see
+[`R-KV/benchmark/RESULTS_dp.md`](R-KV/benchmark/RESULTS_dp.md).
+
 ---
 
 <div align="center" id="sglangtop">

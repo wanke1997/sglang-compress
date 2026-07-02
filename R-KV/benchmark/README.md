@@ -11,11 +11,12 @@ server over the `/generate` HTTP API and judging with simple numeric matching.
 
 | File | Purpose |
 | --- | --- |
-| `launch_server.sh` | Start a server in `baseline` / `rkv <budget>` / `baseline-cudagraph` mode |
+| `launch_server.sh` | Start a server in `baseline` / `rkv <budget>` / `baseline-cudagraph` mode; set `DP=N` for N-way data parallelism |
 | `prepare_data.sh` | Pull the eval dataset (`test.jsonl`) from the `dev` branch |
 | `eval.py` | Drive the server over `/generate`, extract answers, report accuracy + throughput (use `--concurrency N` for server-side batch>1) |
 | `RESULTS.md` | Numbers we measured on Qwen2.5-0.5B-Instruct (H100) |
 | `RESULTS_math7b.md` | Numbers we measured on Qwen2.5-Math-7B-Instruct (H100) |
+| `RESULTS_dp.md` | Data-parallel (`--dp-size N`) correctness + throughput scaling (up to 8× H100) |
 
 ## Prerequisites
 
@@ -44,6 +45,11 @@ python3 eval.py --n 100 --label rkv_b512
 # Add --concurrency N to send requests in parallel, forcing the server to batch
 # (exercises the R-KV batch>=2 per-request path):
 python3 eval.py --n 20 --concurrency 8 --label rkv_b512_batch8
+
+# Data parallel: set DP=N to run N R-KV replicas (plain DP, tp=1). Use a high
+# --concurrency so requests fan out across all replicas. See RESULTS_dp.md.
+DP=4 ./launch_server.sh rkv 512
+python3 eval.py --n 128 --concurrency 64 --label rkv_b512_dp4
 ```
 
 ## Important: why the flags differ
