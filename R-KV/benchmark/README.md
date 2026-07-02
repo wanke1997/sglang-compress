@@ -1,7 +1,7 @@
 # R-KV Benchmark
 
 Reproducible accuracy + speed benchmark for the R-KV KV-cache compression port
-(see [`python/sglang/srt/mem_cache/rkv/`](../python/sglang/srt/mem_cache/rkv/)).
+(see [`python/sglang/srt/mem_cache/rkv/`](../../python/sglang/srt/mem_cache/rkv/)).
 
 It compares an SGLang server **with R-KV on vs off** on a GSM8K-style math
 harness (few-shot MATH prompts with a `#### N` gold answer), talking to the
