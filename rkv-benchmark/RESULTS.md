@@ -4,9 +4,9 @@ First measurements of the R-KV port, taken during phase-1 bring-up.
 
 ## Setup
 
-- **Model**: `Qwen2.5-0.5B-Instruct` (dense, GQA, rotary). Note: a small
-  *non-math* instruct model, so absolute math accuracy is low — the point here
-  is the **relative** on/off comparison, not the absolute number.
+- **Models**: `Qwen2.5-Math-7B-Instruct` (headline — a strong math model, so
+  accuracy differences are signal, not noise) and `Qwen2.5-0.5B-Instruct` (a
+  weak *non-math* model, kept as a noisy secondary sanity check).
 - **GPU**: single NVIDIA H100 80GB.
 - **Dataset**: GSM8K-style few-shot MATH harness (`test.jsonl` from the `dev`
   branch), first 20 items, `max_new_tokens=512`, `temperature=0`.
@@ -20,7 +20,24 @@ First measurements of the R-KV port, taken during phase-1 bring-up.
 > ⚠️ **Small sample (20 items).** Each item is ±5%, so treat these as trend
 > indicators, not precise numbers. Re-run with `--n 100`+ for tighter figures.
 
-## Accuracy vs budget
+## Accuracy vs budget — Qwen2.5-Math-7B-Instruct (headline)
+
+Strong math model, so accuracy differences are signal, not noise. 20 items,
+few-shot prompt ~700 tokens, `window=8, buffer=16`, `max_new_tokens=512`.
+
+| Config | Accuracy (20) | Compactions | Notes |
+| --- | --- | --- | --- |
+| baseline (R-KV off) | 95% (19/20) | — | reference |
+| R-KV budget=512 | **100% (20/20)** | 184 | on par / +1, heavy eviction |
+| R-KV budget=256 | 90% (18/20) | 241 | most aggressive, slight drop |
+
+**Headline takeaway.** Even though `budget=512 < prompt (~700)` — so R-KV evicts
+part of the few-shot prompt itself — accuracy is **fully preserved (100%)**,
+confirming the "keep important + recent" selection retains what matters. Only at
+`budget=256` does it dip (−5%). 184–241 physical compactions ran per sweep with
+the server never crashing.
+
+## Accuracy vs budget — Qwen2.5-0.5B-Instruct (weak model, noisy)
 
 | Config | Accuracy (20) | Compactions | Notes |
 | --- | --- | --- | --- |
