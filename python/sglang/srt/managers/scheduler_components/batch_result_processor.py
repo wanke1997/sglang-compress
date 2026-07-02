@@ -91,6 +91,13 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                _rkv = getattr(
+                    getattr(self.model_worker, "model_runner", None),
+                    "rkv_compressor",
+                    None,
+                )
+                if _rkv is not None:
+                    _rkv.on_request_end(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -855,6 +862,13 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                _rkv = getattr(
+                    getattr(self.model_worker, "model_runner", None),
+                    "rkv_compressor",
+                    None,
+                )
+                if _rkv is not None:
+                    _rkv.on_request_end(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
                 )

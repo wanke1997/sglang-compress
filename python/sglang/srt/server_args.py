@@ -1849,6 +1849,18 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # R-KV (redundancy-aware KV cache compression, decoding-time)
+    # -------------------------------------------------------------------------
+    enable_rkv: A[bool, "Enable R-KV decoding-time KV cache compression"] = False
+    rkv_config: A[
+        Optional[str],
+        Arg(
+            help='A dictionary in JSON string format for R-KV compression. Example: \'{"budget": 1024, "window_size": 8, "buffer_size": 128, "mix_lambda": 0.1}\'',
+            aliases=["--rkv-extra-config"],
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[

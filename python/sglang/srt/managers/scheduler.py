@@ -352,6 +352,8 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.enable_rkv = server_args.enable_rkv
+        self.rkv_compressor = None
 
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
@@ -476,6 +478,10 @@ class Scheduler(
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        if self.enable_rkv:
+            # RKVCompressor was created inside ModelRunner.alloc_memory_pool().
+            self.rkv_compressor = self.tp_worker.model_runner.rkv_compressor
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -843,6 +849,11 @@ class Scheduler(
                 req_to_token_pool=pool,
                 token_to_kv_pool_allocator=allocator,
             )
+        # RKVCompressor is constructed inside alloc_memory_pool (called above),
+        # which runs *after* __init__ took its early coordinator snapshot. Bind
+        # it now that the pools (and the compressor) actually exist.
+        if self.enable_rkv:
+            self.rkv_compressor = self.tp_worker.model_runner.rkv_compressor
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -3078,9 +3089,33 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
+        # R-KV: register new requests and apply the previous step's physical KV
+        # length shrink to seq_lens before it is advanced by prepare_for_decode.
+        if self.rkv_compressor is not None:
+            self._apply_rkv_pre_decode(batch)
+
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
+
+    def _apply_rkv_pre_decode(self, batch: ScheduleBatch):
+        """Register new R-KV requests and apply the previous step's physical KV
+        length shrink to the batch seq_lens tensors, before prepare_for_decode
+        advances them. seq_lens tracks physical KV length; rotary stays logical
+        via RKVCompressor.override_decode_positions at forward time."""
+        for req in batch.reqs:
+            st = self.rkv_compressor.states.get(req.req_pool_idx)
+            if st is None or st.req is not req:
+                self.rkv_compressor.on_request_begin(req)
+        updates = self.rkv_compressor.take_pending_length_updates()
+        if not updates:
+            return
+        for i, req in enumerate(batch.reqs):
+            new_len = updates.get(req.req_pool_idx)
+            if new_len is not None:
+                batch.seq_lens[i] = new_len
+                batch.seq_lens_cpu[i] = new_len
+                batch.orig_seq_lens[i] = new_len
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC

@@ -305,6 +305,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        # R-KV compressor (constructed in alloc_memory_pool, which runs before
+        # attention backends are built). None when R-KV is disabled.
+        self.rkv_compressor = getattr(model_runner, "rkv_compressor", None)
         self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
             model_runner
         )
@@ -759,6 +762,13 @@ class FlashInferAttnBackend(AttentionBackend):
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
             )
+            if self.rkv_compressor is not None:
+                # Bind the compressor onto the *actual* decode forward_batch
+                # (the one the model will run on) and replace positions with
+                # logical ones, since seq_lens now tracks the physical KV length
+                # after R-KV eviction.
+                forward_batch.rkv_compressor = self.rkv_compressor
+                self.rkv_compressor.override_decode_positions(forward_batch)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -1112,6 +1122,17 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer.k_scale,
                     layer.v_scale,
                 )
+
+        rkv_compressor = self.rkv_compressor
+        if rkv_compressor is not None:
+            # Observe this layer's decode step (cache query, accumulate score).
+            rkv_compressor.observe_decode_layer(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k,
+                v,
+                layer,
+                forward_batch,
+            )
 
         # Call the wrapped function
         o = decode_wrapper.forward(
