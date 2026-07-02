@@ -105,9 +105,14 @@ Resolution:
   slot allocation and attention length automatically correct — new tokens append
   at the physical tail, attention reads exactly `budget (+n)` slots.
 - **Positions stay logical.** `override_decode_positions` sets
-  `positions[i] = len(origin_input_ids) + len(output_ids)` for each R-KV
-  request, overriding the physical-length-derived value. For an un-compacted
-  request this equals the normal value, so it is safe to always apply.
+  `positions[i] = len(origin_input_ids) + len(output_ids) - 1` for each R-KV
+  request, overriding the physical-length-derived value. The just-sampled token
+  is already appended to `output_ids` at forward time, so the count *minus one*
+  is the current token's 0-based rotary position; for an un-compacted request
+  this equals the baseline `clamp_position(seq_lens) = seq_lens - 1`, so it is
+  safe to always apply. (Omitting the `-1` was a bug fixed 2026-07-02 — it
+  rotated every R-KV decode token at position+1, leaving a one-slot gap between
+  the prompt and the generation; see §8.)
 
 Scheduler and ModelRunner share the process, so `Req` length fields are updated
 in place during compaction; the batch-level `seq_lens` tensor is updated by the
@@ -156,6 +161,19 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
    a frozen dataclass built *before* `init_memory_pools` binds the compressor, so
    a snapshot field would capture `None`. Fix: look it up dynamically via
    `model_worker.model_runner.rkv_compressor` at the finished-request points.
+4. **Rotary off-by-one in `override_decode_positions` (owner review, 2026-07-02).**
+   The override used `len(origin_input_ids) + len(output_ids)`, but the
+   just-sampled token is already in `output_ids` at forward time, so every R-KV
+   decode token was rotated at `position + 1` (baseline is
+   `clamp_position(seq_lens) = seq_lens - 1`). Impact was small because RoPE is
+   relative — a uniform shift only leaves a single-position gap between the
+   prompt and the generation — so end-to-end output stayed coherent. Fix:
+   subtract 1 (see §5).
+5. **No startup validation of R-KV-incompatible flags (owner review, 2026-07-02).**
+   `--enable-rkv` silently corrupted the KV pool when combined with the radix
+   cache, a captured decode CUDA graph, overlap scheduling, `page_size > 1`, or
+   `tp > 1`. Fix: `ServerArgs._handle_rkv_validation` now rejects those combos at
+   startup with an explicit error.
 
 ## 9. Environment (dev-v0.5.14 needs a newer stack than v0.5.3-era wheels)
 

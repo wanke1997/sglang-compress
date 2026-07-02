@@ -26,17 +26,19 @@ request — **freeing GPU memory while preserving generation quality**.
 
 ## Headline result — Qwen2.5-Math-7B-Instruct (single NVIDIA H100)
 
-GSM8K-style math harness, 20 items, few-shot prompt ≈700 tokens.
-**R-KV keeps full accuracy while running hundreds of physical KV compactions:**
+GSM8K-style math harness, 20 items, few-shot prompt ≈700 tokens, `temperature=0`
+(re-run 2026-07-02, post rotary off-by-one fix).
+**R-KV preserves accuracy exactly while running hundreds of physical KV compactions:**
 
 | Config | Accuracy | KV compactions | Notes |
 | --- | --- | --- | --- |
-| baseline (R-KV off) | 95% | — | reference |
-| **R-KV, budget=512** | **100%** | 184 | lossless — even though `budget < prompt`, so R-KV also evicts part of the prompt |
-| R-KV, budget=256 | 90% | 241 | most aggressive; slight drop |
+| baseline (R-KV off) | 95% (19/20) | — | reference |
+| **R-KV, budget=512** | **95% (19/20)** | ~230 | on par with baseline — even though `budget < prompt`, so R-KV also evicts part of the prompt |
+| R-KV, budget=256 | 95% (19/20) | 227 | most aggressive; still on par |
 
-The server ran **184–241 physical compactions with zero crashes**. Full report:
-[`R-KV/benchmark/RESULTS_math7b.md`](R-KV/benchmark/RESULTS_math7b.md).
+The server ran **227–230 physical compactions with zero crashes**, and at
+`concurrency=8` R-KV budget=512 sustained **272 tok/s** (batched decode). Full
+report: [`R-KV/benchmark/RESULTS_math7b.md`](R-KV/benchmark/RESULTS_math7b.md).
 
 ## Quick start
 
