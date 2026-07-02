@@ -196,11 +196,101 @@ python3 test/srt/mem_cache/test_rkv_integration.py
 bookkeeping, logical-position decoupling, and request lifecycle
 (begin/end/idempotent).
 
-## 11. Known limitations / next
+## 11. Parallelism & batching support
 
-- **`batch=1` fast paths.** `observe_decode_layer` / `maybe_compact` index
-  request 0; extend to per-request loops for batched decode.
-- **O(budget²) similarity** in `cal_similarity` — a phase-2 perf target.
+**Current status: single-GPU, single-request only** — validated at
+`tp_size=1, dp_size=1, batch=1`. Tensor parallel (TP) and data parallel (DP) are
+**not** supported, and `batch > 1` is not handled. The integration layer
+contains **no distributed code** (no `tp_group`, no `all_reduce`, no
+`torch.distributed`) and hard-codes request 0 in the hot path
+(`forward_batch.req_pool_indices[0]` / `forward_batch.seq_lens[0]` in
+`observe_decode_layer` and `maybe_compact`).
+
+### 11.1 `batch > 1` — not handled (easy to add)
+
+`observe_decode_layer` and `maybe_compact` only ever look at request 0. Any
+other request in the same decode batch is **silently never compressed** — it
+keeps growing its KV normally while request 0 gets evicted. There is no
+correctness hazard for request 0 itself; the others just don't benefit.
+
+**To fix:** loop over `forward_batch.req_pool_indices` instead of `[0]`, and
+keep the arm flag / score accumulator / compaction per request (the state map is
+already keyed by `req_pool_idx`). The query ring buffer and scoring are already
+per-request; only the hot-path indexing is hard-coded. This is a small, local
+change with **no cross-rank concern**.
+
+### 11.2 Tensor parallel (TP ≥ 2) — NOT supported, silently incorrect ⚠️
+
+This is the dangerous case: it will not crash, it will **corrupt the KV cache**.
+
+Under TP, each rank holds only a **subset of the KV heads**. R-KV's importance /
+redundancy score is reduced with a **mean over heads** — but each rank can only
+see *its own* heads. Therefore:
+
+1. each rank computes a **different** per-token score → selects a **different**
+   `kept` set;
+2. yet KV-slot allocation and `req_to_token` are **synchronized and identical**
+   across ranks (every rank gets the same `out_cache_loc` each step, and the
+   scheduler drives one logical sequence);
+3. so `_compact_request` rewrites `req_to_token` **differently** and calls
+   `free()` on **different physical slots** on each rank → the physical KV
+   layout **diverges between ranks**.
+
+Once the layout diverges, FlashInfer reads the wrong slots on some ranks and the
+allocator's slot accounting no longer matches the (shared) `req_to_token` — i.e.
+wrong attention outputs and, eventually, pool corruption. **Nothing detects
+this**, because each rank is internally self-consistent; only the *cross-rank*
+agreement is broken.
+
+**To support TP**, the per-token score must be **all-reduced across the
+attention-TP group** (summing each rank's head contributions) into one global
+score *before* `kept` is assembled, so every rank evicts the **exact same**
+tokens and keeps `req_to_token` identical. Concretely the compressor would need:
+
+- a handle to the attention-TP process group (e.g. `model_runner.tp_group` /
+  `attention_tp_group`);
+- an `all_reduce(SUM)` of the accumulated per-token score in `maybe_compact`,
+  right before `_assemble_kept`;
+- (ideally) an assertion that every rank derived the identical `kept` indices.
+
+None of this exists today, so **`--tp 2` or higher will silently produce wrong
+results.** If TP is attempted before this is implemented, it should be hard-
+blocked in `server_args` (reject `enable_rkv && tp_size > 1`).
+
+### 11.3 Data parallel / dp-attention (DP ≥ 2) — unverified, no fundamental blocker
+
+Under DP each rank serves a **disjoint set of requests** with its own KV pool;
+requests never cross ranks. So "each rank runs its own R-KV over its own
+requests" is self-consistent in principle — unlike TP there is **no cross-rank
+eviction-agreement problem**. What is missing is only:
+
+1. the `batch > 1` hard-coding (§11.1) still applies within each rank;
+2. the dp-attention `forward_batch` layout (padded/scattered tokens, per-rank
+   `num_real_reqs`, all-gather of attention inputs) has **not been tested** with
+   R-KV's `observe` / `override_decode_positions` / `maybe_compact` hooks.
+
+Likely extends with modest work, but it is neither implemented nor tested.
+
+### Support matrix
+
+| Config | Status | Blocker |
+| --- | --- | --- |
+| `batch=1, tp=1, dp=1` | ✅ validated | — |
+| `batch > 1` | ❌ not handled | hard-coded `[0]`; loop over requests (local, easy) |
+| **TP ≥ 2** | ❌ **silently incorrect** | **missing cross-rank all-reduce of scores** (fundamental) |
+| DP ≥ 2 | ❌ untested | batch loop + dp-attention verification (no fundamental conflict) |
+
+> **Recommendation:** until §11.2 is implemented, treat `--enable-rkv` as
+> incompatible with `--tp > 1`, and ideally reject that combination at startup.
+
+## 12. Other limitations / next
+
+- **O(budget²) similarity** in `cal_similarity` — a phase-2 perf target
+  (chunking / a cheaper redundancy estimate).
 - **No CUDA-graph decode** yet (dynamic eviction can't live in a captured
   graph). Phase-2 would need a graph-compatible compaction scheme.
-- Accuracy validation (MATH-500 / AIME-24) is the next milestone.
+- **`on_request_end`** is wired at finish, but state is otherwise only cleared
+  lazily on `req_pool_idx` reuse — fine for phase 1.
+- Larger-sample accuracy (MATH-500 / AIME-24) and a long-sequence throughput
+  test (to show the memory/latency *benefit*, not just the overhead) are the
+  next milestones.
