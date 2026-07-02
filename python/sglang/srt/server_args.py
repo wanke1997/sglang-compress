@@ -2550,6 +2550,8 @@ class ServerArgs:
 
         self._handle_cuda_graph_config()
 
+        self._handle_rkv_validation()
+
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
@@ -2959,6 +2961,36 @@ class ServerArgs:
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
         self._validate_cuda_graph_config()
+
+    def _handle_rkv_validation(self):
+        """Enforce the invariants R-KV's memory safety depends on.
+
+        See R-KV/doc/DESIGN.md: R-KV physically frees KV slots mid-generation,
+        which is incompatible with prefix caching (the radix tree would keep
+        references into freed slots), captured decode CUDA graphs (eviction is
+        dynamic), page_size > 1 (per-slot free), overlap scheduling (phase 1),
+        and TP > 1 (per-rank eviction would diverge).
+        """
+        if not self.enable_rkv:
+            return
+        if not self.disable_radix_cache:
+            raise ValueError(
+                "--enable-rkv requires --disable-radix-cache: R-KV frees KV "
+                "slots that the radix/prefix cache would still reference."
+            )
+        if not (self.disable_decode_cuda_graph or self.disable_cuda_graph):
+            raise ValueError(
+                "--enable-rkv requires --disable-decode-cuda-graph: dynamic "
+                "eviction cannot run inside a captured CUDA graph."
+            )
+        if not self.disable_overlap_schedule:
+            raise ValueError(
+                "--enable-rkv requires --disable-overlap-schedule (phase 1)."
+            )
+        if self.page_size not in (None, 1):
+            raise ValueError("--enable-rkv requires --page-size 1 (per-slot free).")
+        if self.tp_size > 1:
+            raise ValueError("--enable-rkv does not support tensor parallelism yet.")
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
