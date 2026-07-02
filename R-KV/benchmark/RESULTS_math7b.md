@@ -71,7 +71,7 @@ still needed to show the upside.
 ## Reproduce
 
 ```bash
-cd rkv-benchmark
+cd R-KV/benchmark
 ./prepare_data.sh   # or use an existing test.jsonl via --data
 
 # baseline (eager)

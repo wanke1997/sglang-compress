@@ -3,7 +3,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$DIR/.." && pwd)"
+REPO="$(cd "$DIR/../.." && pwd)"
 OUT="$DIR/data/gsm8k_fewshot.jsonl"
 
 mkdir -p "$DIR/data"

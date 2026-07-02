@@ -17,9 +17,12 @@ request — **freeing GPU memory while preserving generation quality**.
   surviving slots, `free()` the rest, rewrite `req_to_token`, and keep rotary
   positions consistent after the sequence physically shrinks. Runs on the
   FlashInfer decode path.
-- **Code & docs** —
+- **Code** —
   [`python/sglang/srt/mem_cache/rkv/`](python/sglang/srt/mem_cache/rkv/)
-  (`algo.py`, `integration.py`, `DESIGN.md`, `IMPLEMENTATION.md`).
+  (`algo.py`, `integration.py`).
+- **Docs & benchmarks** — [`R-KV/`](R-KV/): design notes in
+  [`R-KV/doc/`](R-KV/doc/) (`DESIGN.md`, `IMPLEMENTATION.md`) and the evaluation
+  suite in [`R-KV/benchmark/`](R-KV/benchmark/).
 
 ## Headline result — Qwen2.5-Math-7B-Instruct (single NVIDIA H100)
 
@@ -33,12 +36,12 @@ GSM8K-style math harness, 20 items, few-shot prompt ≈700 tokens.
 | R-KV, budget=256 | 90% | 241 | most aggressive; slight drop |
 
 The server ran **184–241 physical compactions with zero crashes**. Full report:
-[`rkv-benchmark/RESULTS_math7b.md`](rkv-benchmark/RESULTS_math7b.md).
+[`R-KV/benchmark/RESULTS_math7b.md`](R-KV/benchmark/RESULTS_math7b.md).
 
 ## Quick start
 
 ```bash
-cd rkv-benchmark
+cd R-KV/benchmark
 ./prepare_data.sh                                                     # fetch the eval set
 MODEL=/path/to/Qwen2.5-Math-7B-Instruct ./launch_server.sh rkv 512    # start server (R-KV on)
 python3 eval.py --n 20 --label rkv_b512                               # run eval in another shell
@@ -47,8 +50,8 @@ python3 eval.py --n 20 --label rkv_b512                               # run eval
 R-KV requires the eager decode path and the prefix cache **off**; `launch_server.sh`
 sets the required flags (`--disable-radix-cache --disable-decode-cuda-graph
 --disable-overlap-schedule --page-size 1`). See
-[`rkv-benchmark/README.md`](rkv-benchmark/README.md) for details and
-[`RESULTS.md`](rkv-benchmark/RESULTS.md) for the 0.5B sanity check.
+[`R-KV/benchmark/README.md`](R-KV/benchmark/README.md) for details and
+[`R-KV/benchmark/RESULTS.md`](R-KV/benchmark/RESULTS.md) for the 0.5B sanity check.
 
 ---
 

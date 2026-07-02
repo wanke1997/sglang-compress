@@ -17,7 +17,7 @@ WINDOW="${WINDOW:-8}"
 BUFFER="${BUFFER:-16}"
 MEM_FRAC="${MEM_FRAC:-0.6}"
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 export PYTHONPATH="$REPO/python"
 export HF_HUB_DISABLE_XET=1  # HF Xet transfer can hang on large files
 

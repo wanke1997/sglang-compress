@@ -858,11 +858,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 RKVConfig,
             )
 
-            rkv_cfg_dict = (
-                json.loads(self.server_args.rkv_config)
-                if self.server_args.rkv_config
-                else {}
-            )
+            sa = self.server_args
+            # Base config from the per-field flags; --rkv-config JSON overrides.
+            rkv_cfg_dict = {
+                "budget": sa.rkv_budget,
+                "window_size": sa.rkv_window_size,
+                "kernel_size": sa.rkv_kernel_size,
+                "mix_lambda": sa.rkv_mix_lambda,
+                "retain_ratio": sa.rkv_retain_ratio,
+                "retain_direction": sa.rkv_retain_direction,
+                "buffer_size": sa.rkv_buffer_size,
+                "min_seq_len": sa.rkv_min_seq_len,
+            }
+            if sa.rkv_config:
+                rkv_cfg_dict.update(json.loads(sa.rkv_config))
             self.rkv_compressor = RKVCompressor(
                 config=RKVConfig(**rkv_cfg_dict),
                 req_to_token_pool=self.req_to_token_pool,

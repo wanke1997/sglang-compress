@@ -1,14 +1,18 @@
 """R-KV integration layer for SGLang v0.5.14.
 
 Bridges the pure, device-agnostic R-KV algorithm (:mod:`.algo`) to SGLang's
-paged KV cache and the FlashInfer decode path. Read ``DESIGN.md`` (especially
+paged KV cache and the FlashInfer decode path. Read ``R-KV/doc/DESIGN.md``
+(especially
 sections 5-9) for the architecture rationale behind the decisions encoded here.
 
 Scope of this module (phase 1, correctness first):
 
-* FlashInfer backend, ``batch == 1``.
+* FlashInfer backend, ``batch >= 1`` with **per-request triggering**: each
+  request independently decides when to compress based on its own KV length
+  (see :meth:`RKVCompressor.observe_decode_layer`).
 * ``page_size == 1`` token pool, so evicted slots free cleanly one-by-one
-  (the paged allocator frees at page granularity; see DESIGN.md section 8).
+  (the paged allocator frees at page granularity; see R-KV/doc/DESIGN.md
+  section 8).
 * Reduction of the algorithm's per-head / per-layer scores into a single global
   per-token eviction decision:
 
@@ -27,7 +31,7 @@ without pulling in the heavy serving stack.
 Wiring into the runtime (``forward_decode`` hook, ``model_runner`` after-forward
 call, ``scheduler`` request begin/end) is intentionally **not** done in this
 file yet -- those touch core files and need on-GPU validation. See the TODOs at
-the bottom and the roadmap in ``DESIGN.md`` section 9.
+the bottom and the roadmap in ``R-KV/doc/DESIGN.md`` section 9.
 """
 
 from __future__ import annotations
@@ -171,7 +175,7 @@ class RKVCompressor:
 
     Borrows the lifecycle-hook naming from ``mem_cache/sparsity`` but shares no
     code with it (that framework is non-destructive; R-KV truly evicts and frees
-    slots -- see DESIGN.md section 8).
+    slots -- see R-KV/doc/DESIGN.md section 8).
     """
 
     def __init__(
@@ -250,48 +254,63 @@ class RKVCompressor:
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
     ) -> None:
-        """Observe one layer's decode step.
+        """Observe one layer's decode step for every request in the batch.
 
         Called from ``FlashInferAttnBackend.forward_decode`` *after*
         ``set_kv_buffer`` (new K/V already in the pool) and *before* the
-        attention wrapper runs. batch=1.
+        attention wrapper runs.
 
-        Responsibilities:
+        Supports ``batch >= 1`` with **per-request triggering** (method A): each
+        request independently arms a compaction once its own KV length reaches
+        ``min_seq_len`` and ``buffer_size`` steps have elapsed since its last
+        compaction. Row ``i`` of ``q`` / ``req_pool_indices`` / ``seq_lens`` all
+        refer to the same request (decode batches are aligned, one token/req).
+
+        Responsibilities per request:
           * cache this layer's query into the observation window;
           * when a compaction is armed for this step, compute this layer's
             per-token score and accumulate it across layers.
         """
-        # TODO(wiring): only handle the single real request for batch=1. Extend
-        # to per-request loops over forward_batch.req_pool_indices in phase 2.
-        req_pool_idx = int(forward_batch.req_pool_indices[0].item())
-        state = self.states.get(req_pool_idx)
-        if state is None:
-            return
-
         layer_idx = layer.layer_id - self.start_layer
-        seq_len = int(forward_batch.seq_lens[0].item())
 
-        # Arm/advance once per step, on the first layer we see.
-        if layer_idx == 0:
-            state.begin_step()
-            if (
-                state.steps_since_compact >= self.config.buffer_size
-                and seq_len >= self.config.min_seq_len
-            ):
-                self._armed.add(req_pool_idx)
-                # (bsz=1) accumulator over past tokens, filled lazily below.
-                state.score_accum = None
+        # One host sync per layer call (not per request): pull the batch's
+        # req_pool_indices and physical seq_lens to CPU.
+        req_indices = forward_batch.req_pool_indices.tolist()
+        seq_lens_src = forward_batch.seq_lens_cpu
+        if seq_lens_src is None:
+            seq_lens_src = forward_batch.seq_lens
+        seq_lens = seq_lens_src.tolist()
 
-        # q for batch=1 is (q_head_num, head_dim) after the caller squeezes the
-        # token dim; store it in the ring buffer.
-        state.push_query(layer_idx, q.reshape(q.shape[-2], q.shape[-1]))
+        for i, req_pool_idx in enumerate(req_indices):
+            req_pool_idx = int(req_pool_idx)
+            state = self.states.get(req_pool_idx)
+            if state is None:
+                continue
 
-        if req_pool_idx in self._armed:
-            layer_score = self._layer_score(state, layer_idx, seq_len)
-            if state.score_accum is None:
-                state.score_accum = layer_score
-            else:
-                state.score_accum += layer_score
+            seq_len = int(seq_lens[i])
+
+            # Arm/advance once per step, on the first layer we see.
+            if layer_idx == 0:
+                state.begin_step()
+                if (
+                    state.steps_since_compact >= self.config.buffer_size
+                    and seq_len >= self.config.min_seq_len
+                ):
+                    self._armed.add(req_pool_idx)
+                    # Accumulator over past tokens, filled lazily below.
+                    state.score_accum = None
+
+            # q[i] is (q_head_num, head_dim) for this request's single decode
+            # token; store it in the per-request ring buffer.
+            q_i = q[i]
+            state.push_query(layer_idx, q_i.reshape(q_i.shape[-2], q_i.shape[-1]))
+
+            if req_pool_idx in self._armed:
+                layer_score = self._layer_score(state, layer_idx, seq_len)
+                if state.score_accum is None:
+                    state.score_accum = layer_score
+                else:
+                    state.score_accum += layer_score
 
     def _layer_score(
         self, state: RKVRequestState, layer_idx: int, seq_len: int
@@ -325,11 +344,14 @@ class RKVCompressor:
         if not self._armed:
             return
 
+        seq_len_by_req = self._seq_len_by_req(forward_batch)
         for req_pool_idx in list(self._armed):
             state = self.states.get(req_pool_idx)
             if state is None or state.score_accum is None:
                 continue
-            seq_len = self._current_seq_len(forward_batch, req_pool_idx)
+            seq_len = seq_len_by_req.get(req_pool_idx)
+            if seq_len is None:
+                continue
             kept = self._assemble_kept(state.score_accum, seq_len)
             self._compact_request(state, seq_len, kept)
 
@@ -418,9 +440,18 @@ class RKVCompressor:
     # Helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _current_seq_len(forward_batch: "ForwardBatch", req_pool_idx: int) -> int:
-        # batch=1 fast path; phase 2 replaces with a proper per-req lookup.
-        return int(forward_batch.seq_lens[0].item())
+    def _seq_len_by_req(forward_batch: "ForwardBatch") -> Dict[int, int]:
+        """Map ``req_pool_idx -> physical seq_len`` for the current batch.
+
+        Uses ``seq_lens_cpu`` when available to avoid a device sync, falling
+        back to ``seq_lens``. Supports ``batch >= 1``.
+        """
+        req_indices = forward_batch.req_pool_indices.tolist()
+        seq_lens_src = forward_batch.seq_lens_cpu
+        if seq_lens_src is None:
+            seq_lens_src = forward_batch.seq_lens
+        seq_lens = seq_lens_src.tolist()
+        return {int(r): int(s) for r, s in zip(req_indices, seq_lens)}
 
     @staticmethod
     def logical_position(req: "Req") -> int:
@@ -466,7 +497,7 @@ class RKVCompressor:
 
 # ---------------------------------------------------------------------------
 # Remaining wiring (NOT done here -- needs on-GPU / running-server validation;
-# see DESIGN.md section 9 roadmap). Design = "scheme A": seq_lens tracks the
+# see R-KV/doc/DESIGN.md section 9 roadmap). Design = "scheme A": seq_lens tracks the
 # PHYSICAL KV length, rotary positions stay LOGICAL.
 #
 #   1. FlashInferAttnBackend.forward_decode: after set_kv_buffer, call

@@ -15,6 +15,7 @@ import os
 import re
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_DATA = os.path.join(_HERE, "data", "gsm8k_fewshot.jsonl")
@@ -82,6 +83,13 @@ def main():
     ap.add_argument("--port", type=int, default=30000)
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--label", default="")
+    ap.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of in-flight requests. >1 forces the server to batch "
+        "(exercises the R-KV batch>=2 per-request path).",
+    )
     args = ap.parse_args()
 
     data = []
@@ -91,29 +99,44 @@ def main():
             if len(data) >= args.n:
                 break
 
-    correct = 0
-    tot_tokens = 0
-    t0 = time.time()
-    for i, d in enumerate(data):
-        prompt = d["request"]["messages"][0]["content"]
-        gold = extract_gold(d["answer"])
+    n = len(data)
+
+    def run_one(item):
+        prompt = item["request"]["messages"][0]["content"]
+        gold = extract_gold(item["answer"])
         gen, ntok = generate(args.port, prompt, args.max_tokens)
-        tot_tokens += ntok
         pred = extract_pred(gen)
         g, p = to_num(gold), to_num(pred)
         ok = g is not None and p is not None and abs(g - p) < 1e-4
+        return gold, pred, ntok, ok
+
+    t0 = time.time()
+    if args.concurrency <= 1:
+        results = [run_one(d) for d in data]
+    else:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            results = list(ex.map(run_one, data))
+    dt = time.time() - t0
+
+    correct = 0
+    tot_tokens = 0
+    for i, (gold, pred, ntok, ok) in enumerate(results):
+        tot_tokens += ntok
         correct += ok
         if i < 5:
             print(f"[{i}] gold={gold} pred={pred} ok={ok} ntok={ntok}")
 
-    dt = time.time() - t0
-    n = len(data)
+    mode = (
+        "serial batch=1"
+        if args.concurrency <= 1
+        else f"concurrency={args.concurrency}"
+    )
     print(
         f"\n=== {args.label} ===\n"
         f"accuracy   : {correct}/{n} = {correct/n:.3f}\n"
         f"avg_tokens : {tot_tokens/n:.0f}\n"
         f"wall_time  : {dt:.1f}s\n"
-        f"throughput : {tot_tokens/dt:.1f} tok/s (end-to-end, serial batch=1)"
+        f"throughput : {tot_tokens/dt:.1f} tok/s (end-to-end, {mode})"
     )
 
 

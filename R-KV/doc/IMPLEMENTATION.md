@@ -21,8 +21,9 @@ The port is split into two layers:
 | **Algorithm** | [`algo.py`](./algo.py) | Pure, device-agnostic R-KV scoring & selection. Zero SGLang deps. CPU-testable. |
 | **Integration** | [`integration.py`](./integration.py) | Bridges the algorithm to SGLang's paged KV pool, FlashInfer decode path, and scheduler lifecycle. |
 
-Phase-1 scope: **FlashInfer backend, `batch=1`, `page_size=1`, correctness
-first.**
+Phase-1 scope: **FlashInfer backend, `page_size=1`, correctness first.**
+`batch >= 1` is supported via **per-request triggering** (each request decides
+independently when to compress); see §11.
 
 ## 2. The core tension (and how we resolve it)
 
@@ -133,7 +134,7 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
 
 | File | Change |
 | --- | --- |
-| `server_args.py` | `--enable-rkv`, `--rkv-config '{...}'` |
+| `server_args.py` | `--enable-rkv`; per-field flags `--rkv-budget`, `--rkv-window-size`, `--rkv-kernel-size`, `--rkv-mix-lambda`, `--rkv-retain-ratio`, `--rkv-retain-direction`, `--rkv-buffer-size`, `--rkv-min-seq-len`; `--rkv-config '{...}'` JSON overrides the per-field flags |
 | `model_executor/model_runner.py` | Build `RKVCompressor` in `alloc_memory_pool` (after pools exist); call `maybe_compact` after the decode forward pass |
 | `layers/attention/flashinfer_backend.py` | Backend holds `rkv_compressor`; in `init_forward_metadata` bind it onto the real decode batch + `override_decode_positions`; call `observe_decode_layer` in `forward_decode` after `set_kv_buffer` |
 | `managers/scheduler.py` | Re-bind `rkv_compressor` in `init_memory_pools` (see §8); `_apply_rkv_pre_decode` before `prepare_for_decode` |
@@ -192,32 +193,32 @@ path):
 python3 test/srt/mem_cache/test_rkv_integration.py
 ```
 
-7 cases: kept-set assembly, slot relocation, overlap safety, physical-length
-bookkeeping, logical-position decoupling, and request lifecycle
-(begin/end/idempotent).
+9 cases: kept-set assembly, slot relocation, overlap safety, physical-length
+bookkeeping, logical-position decoupling, request lifecycle
+(begin/end/idempotent), and batch >= 2 per-request triggering (arming + compaction).
 
 ## 11. Parallelism & batching support
 
-**Current status: single-GPU, single-request only** — validated at
-`tp_size=1, dp_size=1, batch=1`. Tensor parallel (TP) and data parallel (DP) are
-**not** supported, and `batch > 1` is not handled. The integration layer
-contains **no distributed code** (no `tp_group`, no `all_reduce`, no
-`torch.distributed`) and hard-codes request 0 in the hot path
-(`forward_batch.req_pool_indices[0]` / `forward_batch.seq_lens[0]` in
-`observe_decode_layer` and `maybe_compact`).
+**Current status: single-GPU, `batch >= 1`** — validated at
+`tp_size=1, dp_size=1` for both `batch=1` and `batch > 1`. Tensor parallel (TP)
+and data parallel (DP) are **not** supported. The integration layer contains
+**no distributed code** (no `tp_group`, no `all_reduce`, no `torch.distributed`).
 
-### 11.1 `batch > 1` — not handled (easy to add)
+### 11.1 `batch > 1` — supported (method A: per-request triggering)
 
-`observe_decode_layer` and `maybe_compact` only ever look at request 0. Any
-other request in the same decode batch is **silently never compressed** — it
-keeps growing its KV normally while request 0 gets evicted. There is no
-correctness hazard for request 0 itself; the others just don't benefit.
+`observe_decode_layer` loops over every request in the decode batch
+(`forward_batch.req_pool_indices`), and each request **independently** arms a
+compaction once its own KV length reaches `min_seq_len` and `buffer_size` steps
+have elapsed since its last compaction. Per-request arm flags, score
+accumulators, query ring buffers, and compaction are all keyed by
+`req_pool_idx`; `maybe_compact` resolves each armed request's own physical
+`seq_len` via `_seq_len_by_req(forward_batch)`. No cross-rank concern.
 
-**To fix:** loop over `forward_batch.req_pool_indices` instead of `[0]`, and
-keep the arm flag / score accumulator / compaction per request (the state map is
-already keyed by `req_pool_idx`). The query ring buffer and scoring are already
-per-request; only the hot-path indexing is hard-coded. This is a small, local
-change with **no cross-rank concern**.
+> A batch-wide alternative ("compress the whole batch when the longest sequence
+> exceeds budget") was considered and rejected: short requests below budget are
+> no-ops (`select_indices` returns `None`), so it does the same real work as
+> method A while adding wasted checks on short requests and ragged-slot batching
+> overhead — no speedup.
 
 ### 11.2 Tensor parallel (TP ≥ 2) — NOT supported, silently incorrect ⚠️
 
@@ -264,7 +265,8 @@ requests never cross ranks. So "each rank runs its own R-KV over its own
 requests" is self-consistent in principle — unlike TP there is **no cross-rank
 eviction-agreement problem**. What is missing is only:
 
-1. the `batch > 1` hard-coding (§11.1) still applies within each rank;
+1. per-rank `batch > 1` already works (§11.1), but has only been validated in
+   the single-rank (`dp=1`) case;
 2. the dp-attention `forward_batch` layout (padded/scattered tokens, per-rank
    `num_real_reqs`, all-gather of attention inputs) has **not been tested** with
    R-KV's `observe` / `override_decode_positions` / `maybe_compact` hooks.
@@ -276,7 +278,7 @@ Likely extends with modest work, but it is neither implemented nor tested.
 | Config | Status | Blocker |
 | --- | --- | --- |
 | `batch=1, tp=1, dp=1` | ✅ validated | — |
-| `batch > 1` | ❌ not handled | hard-coded `[0]`; loop over requests (local, easy) |
+| `batch > 1` (tp=1, dp=1) | ✅ supported | per-request triggering (method A) |
 | **TP ≥ 2** | ❌ **silently incorrect** | **missing cross-rank all-reduce of scores** (fundamental) |
 | DP ≥ 2 | ❌ untested | batch loop + dp-attention verification (no fundamental conflict) |
 

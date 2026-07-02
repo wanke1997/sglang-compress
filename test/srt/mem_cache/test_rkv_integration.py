@@ -297,6 +297,124 @@ class TestLogicalPosition(unittest.TestCase):
         self.assertEqual(RKVCompressor.logical_position(req), 120)
 
 
+class TestBatchObserve(unittest.TestCase):
+    """batch >= 2 per-request triggering (method A).
+
+    Two requests share a decode batch; only the one whose own KV length reaches
+    ``min_seq_len`` (and after ``buffer_size`` steps) may arm a compaction. The
+    short request must never arm, even while the long one does.
+    """
+
+    def _build(self):
+        self.device = torch.device("cpu")
+        self.dtype = torch.float32
+        self.num_layers = 2
+        self.head_num = 2
+        self.head_dim = 4
+        self.window = 2
+        self.budget = 4
+        self.min_seq_len = 6
+        self.buffer_size = 3
+
+        self.r2t_pool = MockReqToTokenPool(4, 64, self.device)
+        self.kv_pool = MockKVPool(
+            self.num_layers, 64, self.head_num, self.head_dim, self.device, self.dtype
+        )
+        cfg = RKVConfig(
+            budget=self.budget,
+            window_size=self.window,
+            buffer_size=self.buffer_size,
+            min_seq_len=self.min_seq_len,
+        )
+        comp = RKVCompressor(
+            config=cfg,
+            req_to_token_pool=self.r2t_pool,
+            token_to_kv_pool=self.kv_pool,
+            kv_allocator=MockAllocator(),
+            start_layer=0,
+            end_layer=self.num_layers,
+            device=self.device,
+        )
+
+        # req A (idx 1): long enough to be eligible; req B (idx 2): short.
+        self.long_idx, self.long_len = 1, 6
+        self.short_idx, self.short_len = 2, 3
+        comp.on_request_begin(_MockReq(20, 0, req_pool_idx=self.long_idx))
+        comp.on_request_begin(_MockReq(3, 0, req_pool_idx=self.short_idx))
+
+        # Physical slots so _layer_score can gather real KV for the long req.
+        self.r2t_pool.req_to_token[self.long_idx, : self.long_len] = torch.arange(
+            10, 10 + self.long_len, dtype=torch.int32
+        )
+        self.r2t_pool.req_to_token[self.short_idx, : self.short_len] = torch.arange(
+            30, 30 + self.short_len, dtype=torch.int32
+        )
+        for layer in range(self.num_layers):
+            self.kv_pool.get_key_buffer(layer).normal_()
+
+        self.comp = comp
+
+    def _forward_batch(self):
+        return types.SimpleNamespace(
+            req_pool_indices=torch.tensor(
+                [self.long_idx, self.short_idx], dtype=torch.int32
+            ),
+            seq_lens=torch.tensor([self.long_len, self.short_len], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor(
+                [self.long_len, self.short_len], dtype=torch.int32
+            ),
+        )
+
+    def test_only_eligible_request_arms(self):
+        self._build()
+        torch.manual_seed(0)
+        fb = self._forward_batch()
+
+        # Feed buffer_size decode steps; each step touches all layers.
+        for _ in range(self.buffer_size):
+            for layer_idx in range(self.num_layers):
+                layer = types.SimpleNamespace(layer_id=layer_idx)
+                q = torch.randn(2, self.head_num, self.head_dim)
+                self.comp.observe_decode_layer(q, None, None, layer, fb)
+
+        # Long request armed; short request did not.
+        self.assertIn(self.long_idx, self.comp._armed)
+        self.assertNotIn(self.short_idx, self.comp._armed)
+
+        # begin_step advanced both requests once per step (per-request state).
+        self.assertEqual(
+            self.comp.states[self.long_idx].steps_since_compact, self.buffer_size
+        )
+        self.assertEqual(
+            self.comp.states[self.short_idx].steps_since_compact, self.buffer_size
+        )
+
+        # Armed request accumulated a per-past-token score of the right shape.
+        accum = self.comp.states[self.long_idx].score_accum
+        self.assertIsNotNone(accum)
+        self.assertEqual(accum.shape, (self.long_len - self.window,))
+        self.assertIsNone(self.comp.states[self.short_idx].score_accum)
+
+    def test_maybe_compact_uses_per_request_seq_len(self):
+        self._build()
+        torch.manual_seed(1)
+        fb = self._forward_batch()
+        for _ in range(self.buffer_size):
+            for layer_idx in range(self.num_layers):
+                layer = types.SimpleNamespace(layer_id=layer_idx)
+                q = torch.randn(2, self.head_num, self.head_dim)
+                self.comp.observe_decode_layer(q, None, None, layer, fb)
+
+        self.comp.maybe_compact(fb)
+
+        # Only the long request was compacted, shrunk to budget.
+        self.assertEqual(
+            self.comp.pending_length_updates.get(self.long_idx), self.budget
+        )
+        self.assertNotIn(self.short_idx, self.comp.pending_length_updates)
+        self.assertEqual(len(self.comp._armed), 0)
+
+
 class TestLifecycle(unittest.TestCase):
     def _compressor(self):
         return RKVCompressor(

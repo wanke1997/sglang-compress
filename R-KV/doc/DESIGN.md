@@ -64,7 +64,7 @@ or the full serving stack.
 └───────────────────────────────────────────────────────────┘
                          ▲ called by
 ┌───────────────────────────────────────────────────────────┐
-│  Integration layer  (NOT YET WRITTEN — next phase, GPU)    │
+│  Integration layer  —  integration.py  (DONE, see §9)     │
 │  • per-request R-KV state: query cache, trigger counter,   │
 │      dropped-token count                                   │
 │  • read K/V back from the paged pool for a request         │
@@ -200,10 +200,17 @@ adaptor), the lifecycle hook names (`on_request_begin/end`,
   model_runner; scheduler `_apply_rkv_pre_decode` (on_request_begin + apply the
   physical-length shrink). CPU unit tests:
   `test/srt/mem_cache/test_rkv_integration.py`.
-- **[NEXT] Phase 1 · step 3** — multi-request batching, then accuracy
-  validation. (`on_request_end` cleanup is **DONE**: wired in
-  `batch_result_processor` beside `hisparse.request_finished` at the two
-  real-finished points; verified per-request state clears to 0.)
-- **[LATER] Phase 2** — performance: batching, avoid redundant read-back,
-  optimize the O(budget²) similarity, CUDA-graph compatibility, reduce
-  host/device syncs. Then accuracy validation on MATH-500 / AIME-24.
+- **[DONE] Phase 1 · step 3** — multi-request batching (`batch >= 1`, method A:
+  per-request triggering) + accuracy validation. `observe_decode_layer` loops
+  over every request in the decode batch and each request arms / compacts
+  **independently** (state keyed by `req_pool_idx`; `maybe_compact` resolves each
+  armed request's own `seq_len`). Validated end-to-end on
+  Qwen2.5-Math-7B-Instruct (FlashInfer, `budget=512`, 8 concurrent requests,
+  decode `#running-req` up to 8): **19/20 = 95% accuracy** (== eager baseline),
+  **188 physical compactions**, no crashes. (`on_request_end` cleanup is
+  **DONE**: wired in `batch_result_processor` beside `hisparse.request_finished`
+  at the two real-finished points; verified per-request state clears to 0.)
+- **[LATER] Phase 2** — performance: avoid redundant read-back, optimize the
+  O(budget²) similarity, CUDA-graph compatibility, reduce host/device syncs, and
+  **TP ≥ 2 support** (cross-rank all-reduce of per-token scores; see
+  IMPLEMENTATION.md §11.2). Then larger-sample accuracy on MATH-500 / AIME-24.

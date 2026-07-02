@@ -13,8 +13,9 @@ server over the `/generate` HTTP API and judging with simple numeric matching.
 | --- | --- |
 | `launch_server.sh` | Start a server in `baseline` / `rkv <budget>` / `baseline-cudagraph` mode |
 | `prepare_data.sh` | Pull the eval dataset (`test.jsonl`) from the `dev` branch |
-| `eval.py` | Drive the server over `/generate`, extract answers, report accuracy + throughput |
+| `eval.py` | Drive the server over `/generate`, extract answers, report accuracy + throughput (use `--concurrency N` for server-side batch>1) |
 | `RESULTS.md` | Numbers we measured on Qwen2.5-0.5B-Instruct (H100) |
+| `RESULTS_math7b.md` | Numbers we measured on Qwen2.5-Math-7B-Instruct (H100) |
 
 ## Prerequisites
 
@@ -27,7 +28,7 @@ server over the `/generate` HTTP API and judging with simple numeric matching.
 ## Quick start
 
 ```bash
-cd rkv-benchmark
+cd R-KV/benchmark
 
 # 1. Fetch the dataset (1319 GSM8K-style items) into ./data/
 ./prepare_data.sh
@@ -39,6 +40,10 @@ cd rkv-benchmark
 
 # 2b. Terminal B — run the eval (after the server prints "Uvicorn running"):
 python3 eval.py --n 100 --label rkv_b512
+
+# Add --concurrency N to send requests in parallel, forcing the server to batch
+# (exercises the R-KV batch>=2 per-request path):
+python3 eval.py --n 20 --concurrency 8 --label rkv_b512_batch8
 ```
 
 ## Important: why the flags differ
