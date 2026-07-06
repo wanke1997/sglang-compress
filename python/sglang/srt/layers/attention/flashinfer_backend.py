@@ -308,6 +308,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # R-KV compressor (constructed in alloc_memory_pool, which runs before
         # attention backends are built). None when R-KV is disabled.
         self.rkv_compressor = getattr(model_runner, "rkv_compressor", None)
+        # SnapKV prompt-phase compressor (same construction timing). None when
+        # SnapKV is disabled.
+        self.snapkv_compressor = getattr(model_runner, "snapkv_compressor", None)
         self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
             model_runner
         )
@@ -769,6 +772,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 # after R-KV eviction.
                 forward_batch.rkv_compressor = self.rkv_compressor
                 self.rkv_compressor.override_decode_positions(forward_batch)
+            if self.snapkv_compressor is not None:
+                # After prompt compaction seq_lens tracks the physical (shrunk)
+                # KV length; restore logical rotary positions for decode.
+                forward_batch.snapkv_compressor = self.snapkv_compressor
+                self.snapkv_compressor.override_decode_positions(forward_batch)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -1089,6 +1097,19 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer.k_scale,
                     layer.v_scale,
                 )
+
+        snapkv_compressor = self.snapkv_compressor
+        if snapkv_compressor is not None:
+            # The prompt K/V for this layer is now in the pool (set_kv_buffer ran
+            # in whichever branch above). Observe the observation-window queries
+            # and accumulate this layer's SnapKV importance score per request.
+            snapkv_compressor.observe_prefill_layer(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k,
+                v,
+                layer,
+                forward_batch,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
