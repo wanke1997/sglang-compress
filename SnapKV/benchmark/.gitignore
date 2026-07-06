@@ -1,2 +1,3 @@
-data/
+data/*
+!data/snapkv.txt
 __pycache__/
