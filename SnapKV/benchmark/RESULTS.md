@@ -66,6 +66,42 @@ model. This is the expected behaviour of a KV compressor: lossless while the
 budget is large enough, degrading only once it is pushed far below what the task
 needs. A budget of **256 already gives full retrieval** here.
 
+## SnapKV notebook reproduction — Mistral-7B-Instruct-v0.2
+
+This is the exact upstream notebook demo
+([`FasterDecoding/SnapKV notebooks/example.ipynb`](https://github.com/FasterDecoding/SnapKV/blob/main/notebooks/example.ipynb)),
+reproduced against our SGLang SnapKV port instead of the HuggingFace monkeypatch:
+feed the **full** SnapKV paper (`snapkv.txt`) as the prefill and ask
+`"\n What is the repository of SnapKV?"`. The correct answer
+(`github.com/FasterDecoding/SnapKV`) is a footnote near the start of the paper.
+
+Run with the same model the notebook uses (`Mistral-7B-Instruct-v0.2`, 32k
+context, so the full article fits):
+
+| | Value |
+| --- | --- |
+| model | `Mistral-7B-Instruct-v0.2` (ctx 32768) |
+| article | full `snapkv.txt`, no truncation |
+| `prompt_tokens` | **17 395** |
+| SnapKV budget (`max_capacity_prompt`) | **1024** → **17× compression** |
+| server log | `SnapKV compacted req_pool_idx=2: prompt 17395 -> 1024 slots (freed 16371)` |
+| question | `"\n What is the repository of SnapKV?"` |
+| **answer** | *"The repository of SnapKV is available at `<https://github.com/FasterDecoding/SnapKV>`."* ✅ |
+
+**Takeaway.** After compressing a **17 395-token** prompt down to a **1024-token**
+KV budget (17×), the model still retrieves the correct GitHub repository from the
+surviving KV — an exact reproduction of the upstream SnapKV notebook, now running
+inside SGLang with true physical KV eviction. See
+[`snapkv_notebook_demo.ipynb`](snapkv_notebook_demo.ipynb) for the runnable,
+executed notebook.
+
+> Note on model choice: `Qwen2.5-Math-7B-Instruct` has only a 4096-token context,
+> so the full 16k article must be truncated for it (it still answers correctly on
+> the truncated article). `Qwen2.5-0.5B-Instruct` has a 32k context and takes the
+> full article, but is too weak to emit the exact URL. `Mistral-7B-Instruct-v0.2`
+> (32k context, strong general model) is the notebook's own choice and reproduces
+> it faithfully.
+
 ## Notes
 
 - `budget` here is `max_capacity_prompt` — the number of prompt KV entries kept
