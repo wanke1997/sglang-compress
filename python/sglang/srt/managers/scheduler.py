@@ -354,6 +354,8 @@ class Scheduler(
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
         self.enable_rkv = server_args.enable_rkv
         self.rkv_compressor = None
+        self.enable_snapkv = server_args.enable_snapkv
+        self.snapkv_compressor = None
 
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
@@ -482,6 +484,10 @@ class Scheduler(
         if self.enable_rkv:
             # RKVCompressor was created inside ModelRunner.alloc_memory_pool().
             self.rkv_compressor = self.tp_worker.model_runner.rkv_compressor
+
+        if self.enable_snapkv:
+            # SnapKVCompressor was created inside ModelRunner.alloc_memory_pool().
+            self.snapkv_compressor = self.tp_worker.model_runner.snapkv_compressor
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -854,6 +860,8 @@ class Scheduler(
         # it now that the pools (and the compressor) actually exist.
         if self.enable_rkv:
             self.rkv_compressor = self.tp_worker.model_runner.rkv_compressor
+        if self.enable_snapkv:
+            self.snapkv_compressor = self.tp_worker.model_runner.snapkv_compressor
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -2939,6 +2947,15 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        # SnapKV: register newly-prefilled requests now that prepare_for_extend
+        # has assigned their req_pool_idx, so the prefill forward's observation
+        # hook can find their per-request state.
+        if self.snapkv_compressor is not None:
+            for req in new_batch.reqs:
+                st = self.snapkv_compressor.states.get(req.req_pool_idx)
+                if st is None or st.req is not req:
+                    self.snapkv_compressor.on_request_begin(req)
+
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
@@ -3094,9 +3111,31 @@ class Scheduler(
         if self.rkv_compressor is not None:
             self._apply_rkv_pre_decode(batch)
 
+        # SnapKV: apply the prompt-compaction physical KV length shrink to
+        # seq_lens before prepare_for_decode advances it (rotary stays logical
+        # via SnapKVCompressor.override_decode_positions at forward time).
+        if self.snapkv_compressor is not None:
+            self._apply_snapkv_pre_decode(batch)
+
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
+
+    def _apply_snapkv_pre_decode(self, batch: ScheduleBatch):
+        """Apply SnapKV's prompt-compaction physical KV length shrink to the
+        batch seq_lens tensors before prepare_for_decode advances them. Requests
+        were already registered at prefill time (get_new_batch_prefill), and the
+        compaction happened during the prefill forward, so here we only drain the
+        pending physical lengths."""
+        updates = self.snapkv_compressor.take_pending_length_updates()
+        if not updates:
+            return
+        for i, req in enumerate(batch.reqs):
+            new_len = updates.get(req.req_pool_idx)
+            if new_len is not None:
+                batch.seq_lens[i] = new_len
+                batch.seq_lens_cpu[i] = new_len
+                batch.orig_seq_lens[i] = new_len
 
     def _apply_rkv_pre_decode(self, batch: ScheduleBatch):
         """Register new R-KV requests and apply the previous step's physical KV

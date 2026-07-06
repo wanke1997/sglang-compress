@@ -418,6 +418,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_rkv = server_args.enable_rkv
+        self.enable_snapkv = server_args.enable_snapkv
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -569,6 +570,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For R-KV decoding-time KV compression (constructed in alloc_memory_pool).
         self.rkv_compressor = None
+
+        # For SnapKV prompt-phase KV compression (constructed in alloc_memory_pool).
+        self.snapkv_compressor = None
 
         self._linear_attn_registry_cache: Any = _UNSET
 
@@ -874,6 +878,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 rkv_cfg_dict.update(json.loads(sa.rkv_config))
             self.rkv_compressor = RKVCompressor(
                 config=RKVConfig(**rkv_cfg_dict),
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                kv_allocator=self.token_to_kv_pool_allocator,
+                start_layer=self.start_layer,
+                end_layer=self.start_layer + self.num_effective_layers,
+                device=self.device,
+            )
+
+        if self.enable_snapkv:
+            import json
+
+            from sglang.srt.mem_cache.snapkv.integration import (
+                SnapKVCompressor,
+                SnapKVConfig,
+            )
+
+            sa = self.server_args
+            # Base config from the per-field flags; --snapkv-config JSON overrides.
+            snapkv_cfg_dict = {
+                "max_capacity_prompt": sa.snapkv_max_capacity_prompt,
+                "window_size": sa.snapkv_window_size,
+                "kernel_size": sa.snapkv_kernel_size,
+                "pooling": sa.snapkv_pooling,
+            }
+            if sa.snapkv_config:
+                snapkv_cfg_dict.update(json.loads(sa.snapkv_config))
+            self.snapkv_compressor = SnapKVCompressor(
+                config=SnapKVConfig(**snapkv_cfg_dict),
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool=self.token_to_kv_pool,
                 kv_allocator=self.token_to_kv_pool_allocator,
@@ -3116,6 +3148,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # compaction now (relocates kept slots, frees the tail, rewrites
                 # req_to_token, updates per-request physical lengths).
                 self.rkv_compressor.maybe_compact(forward_batch)
+
+            if (
+                forward_batch.forward_mode.is_extend()
+                and self.snapkv_compressor is not None
+            ):
+                # The full prompt KV for every prefilled request has been
+                # written; run SnapKV prompt compaction now (score the
+                # observation window, keep the budget, free the rest, rewrite
+                # req_to_token, shrink physical lengths for decode).
+                self.snapkv_compressor.maybe_compact(forward_batch)
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

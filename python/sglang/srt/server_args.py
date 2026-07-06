@@ -1892,6 +1892,36 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # SnapKV (prompt-phase / prefill-time KV cache compression)
+    # -------------------------------------------------------------------------
+    enable_snapkv: A[bool, "Enable SnapKV prompt-phase KV cache compression"] = False
+    # Per-field SnapKV hyper-parameters. Defaults mirror SnapKVConfig. Any field
+    # is overridable by --snapkv-config JSON (which takes priority).
+    snapkv_max_capacity_prompt: A[
+        int, "SnapKV: prompt KV entries kept per request after compression."
+    ] = 1024
+    snapkv_window_size: A[
+        int, "SnapKV: trailing observation window whose queries score the prompt."
+    ] = 32
+    snapkv_kernel_size: A[
+        int, "SnapKV: 1-D pooling kernel size for attention clustering."
+    ] = 5
+    snapkv_pooling: A[
+        str,
+        Arg(
+            help="SnapKV: pooling used to cluster attention mass.",
+            choices=["avgpool", "maxpool"],
+        ),
+    ] = "avgpool"
+    snapkv_config: A[
+        Optional[str],
+        Arg(
+            help='A dictionary in JSON string format that OVERRIDES the per-field SnapKV flags above. Example: \'{"max_capacity_prompt": 1024, "window_size": 32, "kernel_size": 5, "pooling": "avgpool"}\'',
+            aliases=["--snapkv-extra-config"],
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
@@ -2552,6 +2582,8 @@ class ServerArgs:
 
         self._handle_rkv_validation()
 
+        self._handle_snapkv_validation()
+
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
@@ -2991,6 +3023,52 @@ class ServerArgs:
             raise ValueError("--enable-rkv requires --page-size 1 (per-slot free).")
         if self.tp_size > 1:
             raise ValueError("--enable-rkv does not support tensor parallelism yet.")
+
+    def _handle_snapkv_validation(self):
+        """Enforce the invariants SnapKV's memory safety depends on.
+
+        See SnapKV/doc/DESIGN.md: SnapKV physically frees prompt KV slots right
+        after prefill, which is incompatible with prefix caching (the radix tree
+        would keep references into freed slots), captured decode CUDA graphs
+        (eviction/positions are dynamic), page_size > 1 (per-slot free), overlap
+        scheduling (phase 1), and TP > 1 (per-rank eviction would diverge). It
+        also needs the whole prompt in a single prefill forward so the
+        observation window is complete, hence chunked prefill must be disabled.
+        Cannot run alongside R-KV (both own the physical-length / rotary
+        bookkeeping).
+        """
+        if not self.enable_snapkv:
+            return
+        if getattr(self, "enable_rkv", False):
+            raise ValueError(
+                "--enable-snapkv and --enable-rkv cannot be used together."
+            )
+        if not self.disable_radix_cache:
+            raise ValueError(
+                "--enable-snapkv requires --disable-radix-cache: SnapKV frees KV "
+                "slots that the radix/prefix cache would still reference."
+            )
+        if not (self.disable_decode_cuda_graph or self.disable_cuda_graph):
+            raise ValueError(
+                "--enable-snapkv requires --disable-decode-cuda-graph: dynamic "
+                "positions after prompt eviction cannot run inside a captured "
+                "CUDA graph."
+            )
+        if not self.disable_overlap_schedule:
+            raise ValueError(
+                "--enable-snapkv requires --disable-overlap-schedule (phase 1)."
+            )
+        if self.page_size not in (None, 1):
+            raise ValueError("--enable-snapkv requires --page-size 1 (per-slot free).")
+        if self.tp_size > 1:
+            raise ValueError("--enable-snapkv does not support tensor parallelism yet.")
+        # Chunked prefill must be off so the full prompt (and its observation
+        # window queries) is processed in a single forward pass.
+        if self.chunked_prefill_size not in (None, -1):
+            raise ValueError(
+                "--enable-snapkv requires --chunked-prefill-size -1: SnapKV needs "
+                "the whole prompt in one prefill forward."
+            )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
