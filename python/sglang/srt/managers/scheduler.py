@@ -2073,6 +2073,7 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                task_type=recv_req.task_type,
             )
             req.tokenizer = self.tokenizer
 
@@ -2952,6 +2953,8 @@ class Scheduler(
         # hook can find their per-request state.
         if self.snapkv_compressor is not None:
             for req in new_batch.reqs:
+                if not self.snapkv_compressor.request_wants_compression(req):
+                    continue
                 st = self.snapkv_compressor.states.get(req.req_pool_idx)
                 if st is None or st.req is not req:
                     self.snapkv_compressor.on_request_begin(req)

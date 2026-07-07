@@ -153,6 +153,17 @@ class SnapKVCompressor:
     # ------------------------------------------------------------------
     # Request lifecycle
     # ------------------------------------------------------------------
+    @staticmethod
+    def request_wants_compression(req: Req) -> bool:
+        """Whether a request opts into SnapKV prompt compression.
+
+        Gated on the request's ``task_type`` (populated from the ``task_type``
+        HTTP header): only ``"summarization"`` requests are compressed; any
+        other value, or a missing / empty hint, leaves the request on full KV.
+        """
+        task_type = getattr(req, "task_type", None)
+        return (task_type or "").strip().lower() == "summarization"
+
     def on_request_begin(self, req: Req) -> None:
         """Register a request and initialise its SnapKV state."""
         if req.req_pool_idx is None:

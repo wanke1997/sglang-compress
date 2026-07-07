@@ -385,5 +385,39 @@ class TestLifecycleAndPositions(unittest.TestCase):
         self.assertEqual(int(fb.positions[0].item()), 34)
 
 
+class TestRequestWantsCompression(unittest.TestCase):
+    """The per-request gate: only task_type == 'summarization' opts in."""
+
+    def _req(self, task_type):
+        return types.SimpleNamespace(task_type=task_type, req_pool_idx=1)
+
+    def test_summarization_opts_in(self):
+        self.assertTrue(
+            SnapKVCompressor.request_wants_compression(self._req("summarization"))
+        )
+
+    def test_case_and_whitespace_insensitive(self):
+        for val in (" Summarization ", "SUMMARIZATION", "summarization\n"):
+            self.assertTrue(
+                SnapKVCompressor.request_wants_compression(self._req(val)),
+                f"should match: {val!r}",
+            )
+
+    def test_other_or_missing_stays_full_kv(self):
+        for val in (None, "", "classification", "choose", "summarize"):
+            self.assertFalse(
+                SnapKVCompressor.request_wants_compression(self._req(val)),
+                f"should NOT match: {val!r}",
+            )
+
+    def test_req_without_task_type_attr(self):
+        # A Req lacking the attribute entirely must not raise -> full KV.
+        self.assertFalse(
+            SnapKVCompressor.request_wants_compression(
+                types.SimpleNamespace(req_pool_idx=1)
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
