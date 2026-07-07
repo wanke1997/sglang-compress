@@ -3028,13 +3028,13 @@ class ServerArgs:
         would keep references into freed slots), captured prefill CUDA graphs
         (the prompt-phase scoring and one-time compaction are dynamic), page_size
         > 1 (per-slot free), overlap scheduling (phase 1), and TP > 1 (per-rank
-        eviction would diverge). It also needs the whole prompt in a single
-        prefill forward so the observation window is complete, hence chunked
-        prefill must be disabled. Decode CUDA graph IS supported: compaction is
-        one-time (before decode) and the only decode-time dynamic (logical rotary
-        positions) is applied at ForwardBatch construction, which both the eager
-        and CUDA-graph-replay paths consume. Cannot run alongside R-KV (both own
-        the physical-length / rotary bookkeeping).
+        eviction would diverge). Decode CUDA graph and chunked prefill ARE
+        supported: compaction is one-time (before decode) and the only
+        decode-time dynamic (logical rotary positions) is applied at
+        ForwardBatch construction, consumed by both the eager and
+        CUDA-graph-replay paths; the observation-window queries are buffered
+        across prefill chunks and scored on the final chunk. Cannot run
+        alongside R-KV (both own the physical-length / rotary bookkeeping).
         """
         if not self.enable_snapkv:
             return
@@ -3062,13 +3062,6 @@ class ServerArgs:
             raise ValueError("--enable-snapkv requires --page-size 1 (per-slot free).")
         if self.tp_size > 1:
             raise ValueError("--enable-snapkv does not support tensor parallelism yet.")
-        # Chunked prefill must be off so the full prompt (and its observation
-        # window queries) is processed in a single forward pass.
-        if self.chunked_prefill_size not in (None, -1):
-            raise ValueError(
-                "--enable-snapkv requires --chunked-prefill-size -1: SnapKV needs "
-                "the whole prompt in one prefill forward."
-            )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
