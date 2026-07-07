@@ -3025,13 +3025,16 @@ class ServerArgs:
 
         See SnapKV/doc/DESIGN.md: SnapKV physically frees prompt KV slots right
         after prefill, which is incompatible with prefix caching (the radix tree
-        would keep references into freed slots), captured decode CUDA graphs
-        (eviction/positions are dynamic), page_size > 1 (per-slot free), overlap
-        scheduling (phase 1), and TP > 1 (per-rank eviction would diverge). It
-        also needs the whole prompt in a single prefill forward so the
-        observation window is complete, hence chunked prefill must be disabled.
-        Cannot run alongside R-KV (both own the physical-length / rotary
-        bookkeeping).
+        would keep references into freed slots), captured prefill CUDA graphs
+        (the prompt-phase scoring and one-time compaction are dynamic), page_size
+        > 1 (per-slot free), overlap scheduling (phase 1), and TP > 1 (per-rank
+        eviction would diverge). It also needs the whole prompt in a single
+        prefill forward so the observation window is complete, hence chunked
+        prefill must be disabled. Decode CUDA graph IS supported: compaction is
+        one-time (before decode) and the only decode-time dynamic (logical rotary
+        positions) is applied at ForwardBatch construction, which both the eager
+        and CUDA-graph-replay paths consume. Cannot run alongside R-KV (both own
+        the physical-length / rotary bookkeeping).
         """
         if not self.enable_snapkv:
             return
@@ -3044,11 +3047,12 @@ class ServerArgs:
                 "--enable-snapkv requires --disable-radix-cache: SnapKV frees KV "
                 "slots that the radix/prefix cache would still reference."
             )
-        if not (self.disable_decode_cuda_graph or self.disable_cuda_graph):
+        if not (self.disable_prefill_cuda_graph or self.disable_cuda_graph):
             raise ValueError(
-                "--enable-snapkv requires --disable-decode-cuda-graph: dynamic "
-                "positions after prompt eviction cannot run inside a captured "
-                "CUDA graph."
+                "--enable-snapkv requires --disable-prefill-cuda-graph: the "
+                "prompt-phase observation and one-time compaction are dynamic "
+                "and cannot run inside a captured prefill CUDA graph. (Decode "
+                "CUDA graph is supported and may stay enabled.)"
             )
         if not self.disable_overlap_schedule:
             raise ValueError(

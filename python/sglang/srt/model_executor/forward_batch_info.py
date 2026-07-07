@@ -801,6 +801,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
+            # SnapKV: after its one-time prompt compaction, seq_lens tracks the
+            # shrunken PHYSICAL KV length, so clamp_position(seq_lens) would
+            # rewind rotary. Restore *logical* positions here — at ForwardBatch
+            # construction — so BOTH the eager forward and the CUDA-graph replay
+            # (which copies forward_batch.positions into its graph input buffer)
+            # observe the correct positions. This is what makes decode CUDA
+            # graph compatible with SnapKV. No-op when SnapKV is off or idle.
+            snapkv_comp = getattr(model_runner, "snapkv_compressor", None)
+            if snapkv_comp is not None and snapkv_comp.states:
+                snapkv_comp.override_decode_positions(ret)
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.

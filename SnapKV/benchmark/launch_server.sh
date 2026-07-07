@@ -30,7 +30,9 @@ export HF_HUB_DISABLE_XET=1  # HF Xet transfer can hang on large files
 # cache OFF (SnapKV frees slots the radix tree still references), overlap OFF
 # (simple timing), page_size=1 (clean per-slot free), and chunked prefill OFF so
 # the whole prompt (and its observation window) is seen in a single forward.
-SNAPKV_FLAGS=(--disable-decode-cuda-graph --disable-prefill-cuda-graph
+# NOTE: decode CUDA graph is now supported with SnapKV (positions are restored
+# at ForwardBatch construction), so only the *prefill* graph is disabled here.
+SNAPKV_FLAGS=(--disable-prefill-cuda-graph
               --disable-overlap-schedule --disable-radix-cache --page-size 1
               --chunked-prefill-size -1)
 
