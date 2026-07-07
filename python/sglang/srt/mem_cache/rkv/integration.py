@@ -87,9 +87,9 @@ class RKVConfig:
             "buffer_size must be >= window_size, otherwise the first compaction "
             "scores against zero-initialized queries in the observation window"
         )
-        assert self.min_seq_len >= self.budget, (
-            "min_seq_len must be >= budget (select_indices keeps budget tokens)"
-        )
+        assert (
+            self.min_seq_len >= self.budget
+        ), "min_seq_len must be >= budget (select_indices keeps budget tokens)"
 
 
 class RKVRequestState:
@@ -142,7 +142,7 @@ class RKVRequestState:
         # physical-length bookkeeping (kv_committed_len / kv_allocated_len).
         # Duck-typed: only needs kv_committed_len / kv_allocated_len /
         # origin_input_ids / output_ids. Set in ``on_request_begin``.
-        self.req: Optional["Req"] = None
+        self.req: Optional[Req] = None
 
     def begin_step(self) -> None:
         """Advance the ring cursor at the start of a new decode step."""
@@ -193,9 +193,9 @@ class RKVCompressor:
     def __init__(
         self,
         config: RKVConfig,
-        req_to_token_pool: "ReqToTokenPool",
-        token_to_kv_pool: "KVCache",
-        kv_allocator: "BaseTokenToKVPoolAllocator",
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool: KVCache,
+        kv_allocator: BaseTokenToKVPoolAllocator,
         start_layer: int,
         end_layer: int,
         device: torch.device,
@@ -230,7 +230,7 @@ class RKVCompressor:
     # ------------------------------------------------------------------
     # Request lifecycle
     # ------------------------------------------------------------------
-    def on_request_begin(self, req: "Req") -> None:
+    def on_request_begin(self, req: Req) -> None:
         """Register a request and initialise its R-KV state."""
         if req.req_pool_idx is None:
             return
@@ -246,7 +246,7 @@ class RKVCompressor:
         state.req = req
         self.states[req.req_pool_idx] = state
 
-    def on_request_end(self, req: "Req") -> None:
+    def on_request_end(self, req: Req) -> None:
         """Drop a request's R-KV state when it finishes or aborts."""
         if req.req_pool_idx is not None and self.states.pop(req.req_pool_idx, None):
             logger.debug(
@@ -263,8 +263,8 @@ class RKVCompressor:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: "RadixAttention",
-        forward_batch: "ForwardBatch",
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
     ) -> None:
         """Observe one layer's decode step for every request in the batch.
 
@@ -351,7 +351,7 @@ class RKVCompressor:
     # ------------------------------------------------------------------
     # Compaction (called once after the full forward pass)
     # ------------------------------------------------------------------
-    def maybe_compact(self, forward_batch: "ForwardBatch") -> None:
+    def maybe_compact(self, forward_batch: ForwardBatch) -> None:
         """Run physical compaction for any request armed this forward pass."""
         if not self._armed:
             return
@@ -369,9 +369,7 @@ class RKVCompressor:
 
         self._armed.clear()
 
-    def _assemble_kept(
-        self, score_accum: torch.Tensor, seq_len: int
-    ) -> torch.Tensor:
+    def _assemble_kept(self, score_accum: torch.Tensor, seq_len: int) -> torch.Tensor:
         """Global kept-token indices: top past tokens + trailing window.
 
         ``score_accum`` covers the past tokens ``[0, seq_len - window)``.
@@ -401,8 +399,8 @@ class RKVCompressor:
         r2t = self.req_to_token_pool.req_to_token
 
         slots = r2t[idx, :seq_len].long().clone()  # physical slots, temporal order
-        src = slots[kept_local]                    # surviving physical slots (budget,)
-        dst = slots[:budget]                       # target front slots (budget,)
+        src = slots[kept_local]  # surviving physical slots (budget,)
+        dst = slots[:budget]  # target front slots (budget,)
 
         # Relocate K/V for every layer. Clone before write so overlapping
         # src/dst ranges don't corrupt each other.
@@ -452,7 +450,7 @@ class RKVCompressor:
     # Helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _seq_len_by_req(forward_batch: "ForwardBatch") -> Dict[int, int]:
+    def _seq_len_by_req(forward_batch: ForwardBatch) -> Dict[int, int]:
         """Map ``req_pool_idx -> physical seq_len`` for the current batch.
 
         Uses ``seq_lens_cpu`` when available to avoid a device sync, falling
@@ -466,7 +464,7 @@ class RKVCompressor:
         return {int(r): int(s) for r, s in zip(req_indices, seq_lens)}
 
     @staticmethod
-    def logical_position(req: "Req") -> int:
+    def logical_position(req: Req) -> int:
         """Rotary position of a request's NEXT token.
 
         Equals the total number of tokens seen so far
@@ -489,7 +487,7 @@ class RKVCompressor:
         self.pending_length_updates = {}
         return updates
 
-    def override_decode_positions(self, forward_batch: "ForwardBatch") -> None:
+    def override_decode_positions(self, forward_batch: ForwardBatch) -> None:
         """Replace decode positions with *logical* positions for R-KV requests.
 
         ``seq_lens`` now tracks the (possibly shorter) physical KV length, so

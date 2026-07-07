@@ -1854,20 +1854,16 @@ class ServerArgs:
     enable_rkv: A[bool, "Enable R-KV decoding-time KV cache compression"] = False
     # Per-field R-KV hyper-parameters. Defaults mirror RKVConfig. Any field left
     # at its default is overridable by --rkv-config JSON (which takes priority).
-    rkv_budget: A[
-        int, "R-KV: KV entries kept per request after compression."
-    ] = 1024
-    rkv_window_size: A[
-        int, "R-KV: trailing observation window always retained."
-    ] = 8
-    rkv_kernel_size: A[
-        int, "R-KV: pooling kernel size for importance smoothing."
-    ] = 7
+    rkv_budget: A[int, "R-KV: KV entries kept per request after compression."] = 1024
+    rkv_window_size: A[int, "R-KV: trailing observation window always retained."] = 8
+    rkv_kernel_size: A[int, "R-KV: pooling kernel size for importance smoothing."] = 7
     rkv_mix_lambda: A[
-        float, "R-KV: importance vs redundancy mix (0=redundancy only, 1=importance only)."
+        float,
+        "R-KV: importance vs redundancy mix (0=redundancy only, 1=importance only).",
     ] = 0.1
     rkv_retain_ratio: A[
-        float, "R-KV: fraction of most-recent similar neighbours exempted from redundancy."
+        float,
+        "R-KV: fraction of most-recent similar neighbours exempted from redundancy.",
     ] = 0.1
     rkv_retain_direction: A[
         str,

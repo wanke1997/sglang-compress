@@ -197,11 +197,15 @@ class R1KV:
         past_indices = final_score.topk(self.budget - self.window_size, dim=-1).indices
 
         bsz, kv_heads = past_indices.shape[0], past_indices.shape[1]
-        window_indices = torch.arange(
-            kv_cache_len - self.window_size,
-            kv_cache_len,
-            device=past_indices.device,
-        ).view(1, 1, -1).expand(bsz, kv_heads, -1)
+        window_indices = (
+            torch.arange(
+                kv_cache_len - self.window_size,
+                kv_cache_len,
+                device=past_indices.device,
+            )
+            .view(1, 1, -1)
+            .expand(bsz, kv_heads, -1)
+        )
 
         kept = torch.cat([past_indices, window_indices], dim=-1)
         if sort:

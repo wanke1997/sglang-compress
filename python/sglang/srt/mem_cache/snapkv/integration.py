@@ -79,9 +79,10 @@ class SnapKVConfig:
         assert (
             self.max_capacity_prompt > self.window_size
         ), "max_capacity_prompt must exceed window_size"
-        assert self.pooling in ("avgpool", "maxpool"), (
-            "pooling must be 'avgpool' or 'maxpool'"
-        )
+        assert self.pooling in (
+            "avgpool",
+            "maxpool",
+        ), "pooling must be 'avgpool' or 'maxpool'"
 
 
 class SnapKVRequestState:
@@ -110,7 +111,7 @@ class SnapKVRequestState:
         # physical-length bookkeeping (kv_committed_len / kv_allocated_len) and
         # so decode positions can be kept logical. Duck-typed: only needs
         # kv_committed_len / kv_allocated_len / origin_input_ids / output_ids.
-        self.req: Optional["Req"] = None
+        self.req: Optional[Req] = None
 
 
 class SnapKVCompressor:
@@ -124,9 +125,9 @@ class SnapKVCompressor:
     def __init__(
         self,
         config: SnapKVConfig,
-        req_to_token_pool: "ReqToTokenPool",
-        token_to_kv_pool: "KVCache",
-        kv_allocator: "BaseTokenToKVPoolAllocator",
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool: KVCache,
+        kv_allocator: BaseTokenToKVPoolAllocator,
         start_layer: int,
         end_layer: int,
         device: torch.device,
@@ -152,7 +153,7 @@ class SnapKVCompressor:
     # ------------------------------------------------------------------
     # Request lifecycle
     # ------------------------------------------------------------------
-    def on_request_begin(self, req: "Req") -> None:
+    def on_request_begin(self, req: Req) -> None:
         """Register a request and initialise its SnapKV state."""
         if req.req_pool_idx is None:
             return
@@ -160,7 +161,7 @@ class SnapKVCompressor:
         state.req = req
         self.states[req.req_pool_idx] = state
 
-    def on_request_end(self, req: "Req") -> None:
+    def on_request_end(self, req: Req) -> None:
         """Drop a request's SnapKV state when it finishes or aborts."""
         if req.req_pool_idx is not None and self.states.pop(req.req_pool_idx, None):
             logger.debug(
@@ -177,8 +178,8 @@ class SnapKVCompressor:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: "RadixAttention",
-        forward_batch: "ForwardBatch",
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
     ) -> None:
         """Observe one layer's prefill for every request in the extend batch.
 
@@ -231,8 +232,12 @@ class SnapKVCompressor:
             if req_pool_idx in self._armed:
                 # Window queries for this request: the last window_size rows of
                 # its extend block, shape (window, q_heads, head_dim).
-                window_q = q[start + extend_len - self.config.window_size : start + extend_len]
-                layer_score = self._layer_score(req_pool_idx, seq_len, window_q, layer_idx)
+                window_q = q[
+                    start + extend_len - self.config.window_size : start + extend_len
+                ]
+                layer_score = self._layer_score(
+                    req_pool_idx, seq_len, window_q, layer_idx
+                )
                 if state.score_accum is None:
                     state.score_accum = layer_score
                 else:
@@ -274,7 +279,7 @@ class SnapKVCompressor:
     # ------------------------------------------------------------------
     # Compaction (called once after the full prefill forward pass)
     # ------------------------------------------------------------------
-    def maybe_compact(self, forward_batch: "ForwardBatch") -> None:
+    def maybe_compact(self, forward_batch: ForwardBatch) -> None:
         """Run physical prompt compaction for any request armed this forward."""
         if not self._armed:
             return
@@ -289,9 +294,7 @@ class SnapKVCompressor:
 
         self._armed.clear()
 
-    def _assemble_kept(
-        self, score_accum: torch.Tensor, seq_len: int
-    ) -> torch.Tensor:
+    def _assemble_kept(self, score_accum: torch.Tensor, seq_len: int) -> torch.Tensor:
         """Global kept-token indices: top past tokens + trailing window.
 
         ``score_accum`` covers the past tokens ``[0, seq_len - window)``.
@@ -321,8 +324,8 @@ class SnapKVCompressor:
         r2t = self.req_to_token_pool.req_to_token
 
         slots = r2t[idx, :seq_len].long().clone()  # physical slots, temporal order
-        src = slots[kept_local]                    # surviving physical slots (budget,)
-        dst = slots[:budget]                       # target front slots (budget,)
+        src = slots[kept_local]  # surviving physical slots (budget,)
+        dst = slots[:budget]  # target front slots (budget,)
 
         # Relocate K/V for every layer. Clone before write so overlapping
         # src/dst ranges don't corrupt each other.
@@ -381,7 +384,7 @@ class SnapKVCompressor:
         return src.tolist()
 
     @staticmethod
-    def logical_position(req: "Req") -> int:
+    def logical_position(req: Req) -> int:
         """Rotary position count of a request's tokens seen so far.
 
         Equals ``len(origin_input_ids) + len(output_ids)``, unaffected by prompt
@@ -402,7 +405,7 @@ class SnapKVCompressor:
         self.pending_length_updates = {}
         return updates
 
-    def override_decode_positions(self, forward_batch: "ForwardBatch") -> None:
+    def override_decode_positions(self, forward_batch: ForwardBatch) -> None:
         """Replace decode positions with *logical* positions for SnapKV requests.
 
         ``seq_lens`` now tracks the (shorter) physical KV length after prompt

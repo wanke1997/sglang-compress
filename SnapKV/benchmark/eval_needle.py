@@ -97,9 +97,7 @@ def main():
         help="Truncate the article to this many words (0=full).",
     )
     ap.add_argument("--max-tokens", type=int, default=48)
-    ap.add_argument(
-        "--model", default="/data/model/Qwen2.5-0.5B-Instruct"
-    )
+    ap.add_argument("--model", default="/data/model/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
 

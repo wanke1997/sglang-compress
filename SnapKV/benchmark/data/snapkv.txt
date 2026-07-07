@@ -6,7 +6,7 @@ We discover that each attention head in the model consistently focuses on specif
 
 \begin{figure}[ht]
     \centering\includegraphics[width=0.65\textwidth]{figures/illustration.pdf}
-        \caption{The graph shows the simplified workflow of \kv, where the orange area represents the group of positions per head clustered and selected by \kv. These clustered features are then used to form a new Key-Value pair concatenated with the tokens in the observation window (denoted as `Window'). Together, the selected prefix and observation windows constitute the new KV cache utilized for the generation. 
+        \caption{The graph shows the simplified workflow of \kv, where the orange area represents the group of positions per head clustered and selected by \kv. These clustered features are then used to form a new Key-Value pair concatenated with the tokens in the observation window (denoted as `Window'). Together, the selected prefix and observation windows constitute the new KV cache utilized for the generation.
     }
     \label{fig: algo}
 \end{figure}
@@ -16,7 +16,7 @@ There are many perspectives to mitigate these problems, including KV cache evict
 
 In our paper, we identify the patterns of these important prompt attention features during generation. To validate the robustness of this finding, we also design a thorough set of experiments across diverse inputs in terms of length, format, and content. Based on our observations, we derive an innovative and intuitive method, \kv, which can effectively compress the KV cache for long sequence inputs without compromising the model's accuracy. Our contributions are as follows:
 \begin{itemize}
-    \item We design experiments to explore the patterns of attention features in output generation, focusing on three key questions: 
+    \item We design experiments to explore the patterns of attention features in output generation, focusing on three key questions:
     \begin{enumerate}
         \item Is there a consistent pattern in the attention allocated to prompt tokens?
         \item How does the context and instruction positioning influence this attention allocation pattern?
@@ -27,18 +27,18 @@ In our paper, we identify the patterns of these important prompt attention featu
 
     \item We evaluate \kv for accuracy and efficiency across diverse LLMs and long-sequence datasets, affirming its improvement over previous work and comparability to conventional KV caching. Furthermore, we conduct the Needle-in-a-Haystack test to demonstrate its memory efficiency and illustrate decoding speed enhancements through varied batch sizes and input lengths. In addition, \kv's integration with a leading RAG model showcases its extended performance capabilities. We also show that \kv can be combined orthogonally with other acceleration strategies such as parallel decoding.
 
-    
+
 \end{itemize}
 \section{Related Works}
 
-Many previous works address the KV cache compression by evicting the KV cache using different algorithms. For example, StreamLLM \cite{xiao2023efficient} maintains the first few tokens and the local tokens to effectively reduce the KV cache size. However, it faces the challenge of losing important information since it continuously evicts the KV cache.\footnote{\url{https://github.com/mit-han-lab/streaming-llm?tab=readme-ov-file\#faq}} 
+Many previous works address the KV cache compression by evicting the KV cache using different algorithms. For example, StreamLLM \cite{xiao2023efficient} maintains the first few tokens and the local tokens to effectively reduce the KV cache size. However, it faces the challenge of losing important information since it continuously evicts the KV cache.\footnote{\url{https://github.com/mit-han-lab/streaming-llm?tab=readme-ov-file\#faq}}
 Another perspective is to compress the KV cache for generation steps. Heavy-Hitter Oracle \cite{zhang2024h2o} introduces a KV cache eviction policy that greedily selects tokens during generation steps based on a scoring function derived from cumulative attention. While this approach effectively compresses the KV cache for generated tokens, it overlooks compression of the input sequence KV cache, which is crucial for reducing memory and computational overhead.
 Building on a similar concept, Adaptive KV Compression (FastGen) \cite{ge2023model} implements a dual-phase algorithm that encompasses four KV cache compression policies. Initially, it identifies optimal policies through profiling results obtained from prompt encoding. Subsequently, it dynamically evicts caches during the generation phase based on these policies. Nonetheless, it faces the similar problem with H2O. ScissorHands \cite{liu2024scissorhands} focuses on identifying and retaining pivotal tokens that exhibit a consistent attention weight pattern with previous token windows during generation steps. However, this method concentrates solely on the window of previous pivotal tokens in generation and neglects the extensive input that contains essential information for generating accurate responses. This oversight could lead to an inability to extract detailed information from prompts.
 
 In summary, existing compression methods merely address the challenges encountered in real-world applications, such as document processing and multi-round chats, where prompts are exceptionally long yet require accurate information retrieval. In common use cases, the generated outputs, like summaries, code pieces, or retrieved data, are significantly shorter compared to the extensive input sequences from novels, entire code bases, or annual financial reports. Although these techniques may effectively reduce the KV cache size during the generation phase, they do not tackle the primary overhead and challenges arising from a lack of comprehension of complex input contexts, thus leaving the critical issues unresolved.
 \section{Observations}\label{sec: obs}
 
-In this section, we present our observations regarding the patterns in the Query-Key matrix during token generation. We discuss how these patterns can be potentially exploited for KV cache compression. Our findings are based on the analysis of various generation contexts and the behavior of attention mechanisms in LLMs and are concluded into three key observations as follows: 
+In this section, we present our observations regarding the patterns in the Query-Key matrix during token generation. We discuss how these patterns can be potentially exploited for KV cache compression. Our findings are based on the analysis of various generation contexts and the behavior of attention mechanisms in LLMs and are concluded into three key observations as follows:
 
 \begin{enumerate}
 \item \textbf{Pattern consistency across contexts:} Irrespective of the generation context length, we observed that specific keys within the prompt consistently exhibit higher attention weights. Such ``active'' keys tend to follow stable patterns that appear to be intrinsically related to the structure and content of the prompt. (Sec.~\ref{sec: Multi-Turn Conversations})
@@ -112,7 +112,7 @@ H &= \frac{\sum \mathbf{O}}{\sum \mathbf{M}_{\text{threshold\_cur}}} \label{eq:s
     \label{fig: question_pos}
 \end{figure}
 
-This study examines if the positions of features identified as crucial in the observation window maintain their significance in the subsequent token generation. The analysis utilizes samples from Ultrachat~\cite{ding2023enhancing}, a multi-turns, high-quality instruction dataset consisting of 1.4 million dialogues. We further filter the sequences with response length greater than 512 and prompt length greater than 3k. In the experiment, we split the generated tokens into 4 context windows, each spanning 128 tokens, to compute the averaged hit rates of these windows versus the observation window with size 32. According to the findings presented in Fig.\ref{fig: hit_rate}, important keys in prefixes obtained from voting in observation windows exhibit remarkable consistency throughout the generation process, as evidenced by high hit rates. 
+This study examines if the positions of features identified as crucial in the observation window maintain their significance in the subsequent token generation. The analysis utilizes samples from Ultrachat~\cite{ding2023enhancing}, a multi-turns, high-quality instruction dataset consisting of 1.4 million dialogues. We further filter the sequences with response length greater than 512 and prompt length greater than 3k. In the experiment, we split the generated tokens into 4 context windows, each spanning 128 tokens, to compute the averaged hit rates of these windows versus the observation window with size 32. According to the findings presented in Fig.\ref{fig: hit_rate}, important keys in prefixes obtained from voting in observation windows exhibit remarkable consistency throughout the generation process, as evidenced by high hit rates.
 
 \begin{figure}[ht]
     \centering
@@ -134,7 +134,7 @@ Our investigation also extends to the significance of instruction positioning on
 \subsubsection{Effectiveness of Various Instructions for One Document}
 \label{sec: Do Different Questions Matter for One Document?}
 
-Furthermore, we investigate whether instructions will affect the selection of important features even if the provided context is the same. Our experiment utilizes different instructions on the same document and selects the important features based on the observation window that consists of both the instructions and their corresponding responses. Then we calculate the hit rates between important features selected by different instruction-response pairs within the same document by using \(\mathcal{H}(\text{M}_{\text{vote\_A}}, \text{M}_{\text{vote\_B}})\). By varying the instructions, we observe that different instructions prioritize different prefix keys, as indicated by the descending trend in hit rates shown in Fig. \ref{fig: qa_pairs}. 
+Furthermore, we investigate whether instructions will affect the selection of important features even if the provided context is the same. Our experiment utilizes different instructions on the same document and selects the important features based on the observation window that consists of both the instructions and their corresponding responses. Then we calculate the hit rates between important features selected by different instruction-response pairs within the same document by using \(\mathcal{H}(\text{M}_{\text{vote\_A}}, \text{M}_{\text{vote\_B}})\). By varying the instructions, we observe that different instructions prioritize different prefix keys, as indicated by the descending trend in hit rates shown in Fig. \ref{fig: qa_pairs}.
 Our findings reveal an interesting aspect of KV cache management in LLMs: the important attention features change with different instructions. This variability challenges the effectiveness of static compression methods that depend on constant weighted importance or fixed policies~\cite{liu2024scissorhands,zhang2024h2o,ge2023model}. Thus, the complex relationship between context and related KV cache emphasizes the need for context-aware compression strategies and highlights the limitations of current methods that ignore this dynamic.
 \section{SnapKV}
 \label{sec: 4}
@@ -145,8 +145,8 @@ In the attention mechanism, keys and values are tensors containing information f
 The fundamental approach of \kv involves identifying and selecting the most crucial attention features per head to create the new KV cache. \kv operates through two stages as shown in Fig.~\ref{fig: algo}:
 \begin{itemize}[leftmargin=*]
     \item \textbf{Voting for Important Previous Features}
-    By the voting process defined previously (Eq.~\ref{eq: length}), we select the important features based on the observation window—defined as the last segment of the prompt. Sec.~\ref{sec: Multi-Turn Conversations} highlights the consistency of these attention features throughout the sequence, suggesting that these features are vital for subsequent generation. Besides, we implement clustering to retain the features surrounding the selected features (See Sec.\ref{sec: clustering}). 
-    
+    By the voting process defined previously (Eq.~\ref{eq: length}), we select the important features based on the observation window—defined as the last segment of the prompt. Sec.~\ref{sec: Multi-Turn Conversations} highlights the consistency of these attention features throughout the sequence, suggesting that these features are vital for subsequent generation. Besides, we implement clustering to retain the features surrounding the selected features (See Sec.\ref{sec: clustering}).
+
     \item \textbf{Update and Store Truncated Key and Value}
     We concatenate these selected features with the window features, which encompass all features containing prompt information. We store back the concatenated KV caches for later use in generation and save the memory usage.
 
@@ -160,7 +160,7 @@ def snap_kv(query_states, key_states, value_states, window_size, max_capacity_pr
         return key_states, value_states
     else:
         # Compute attention weights of observing window's queries and prefix context's Keys.
-        attn_weights = compute_attn(query_states[..., -window_size:, :], key_states, attention_mask) 
+        attn_weights = compute_attn(query_states[..., -window_size:, :], key_states, attention_mask)
         # (bsz, num_heads, window_size, k_len)
         # Sum the weight along the query dimension.
         attn_weights_sum = attn_weights[..., -window_size:, :-window_size].sum(dim=-2)
@@ -193,8 +193,8 @@ We then conduct an ablation study on \texttt{Mistral-7B-Instruct-v0.2} to unders
 \texttt{LWM-Text-Chat-1M}~\cite{liu2024world} is a 7B instruction-finetuned model with up to one million context length. In this section, we conduct a pressure test on this model and examine its algorithmic efficiencies through the lens of hardware optimization.
 
 
-\subsubsection{Needle-in-a-Haystack} 
-The Needle-in-a-Haystack test \cite{kamradt2023needle} challenges the model to accurately retrieve information from a specific sentence("needle") hidden within a lengthy document (the "haystack"), with the sentence placed at a random location. To rigorously evaluate \kv's capabilities, we extended the document length to 380k tokens which is the longest content that can be processed by a single A100-80GB GPU. We configured the prompt KV cache size to 1024, enabling \kv to select the most crucial 1024 attention features from the prompt using our algorithm for answer generation, with a maximum pooling kernel size of 5 and a observation window size of 16. The compelling outcomes in Fig. \ref{fig: needle} from the Needle-in-a-Haystack test underscore \kv's potential to precisely manage small details on extremely long input contexts with a 380x compression ratio. 
+\subsubsection{Needle-in-a-Haystack}
+The Needle-in-a-Haystack test \cite{kamradt2023needle} challenges the model to accurately retrieve information from a specific sentence("needle") hidden within a lengthy document (the "haystack"), with the sentence placed at a random location. To rigorously evaluate \kv's capabilities, we extended the document length to 380k tokens which is the longest content that can be processed by a single A100-80GB GPU. We configured the prompt KV cache size to 1024, enabling \kv to select the most crucial 1024 attention features from the prompt using our algorithm for answer generation, with a maximum pooling kernel size of 5 and a observation window size of 16. The compelling outcomes in Fig. \ref{fig: needle} from the Needle-in-a-Haystack test underscore \kv's potential to precisely manage small details on extremely long input contexts with a 380x compression ratio.
 \begin{figure}[ht]
     \centering
         \includegraphics[width=0.9\textwidth]{figures/LWM-Text-Chat-1M_compress.pdf}
@@ -215,7 +215,7 @@ We further benchmark the speed of \texttt{LWM-Text-Chat-1M} under different batc
     \centering
     \includegraphics[width=0.9\textwidth]{figures/Mistral-7B-Instruct-v0.2_nopool.pdf}
     \includegraphics[width=0.9\textwidth]{figures/Mistral-7B-Instruct-v0.2_maxpool.pdf}
-    \caption{Ablation study of pooling on LongEval-Lines. The evaluation includes inputs, each comprised of lines formatted as "\texttt{line makeshift-penguin: REGISTER\_CONTENT is <10536>}", where the key is an adjective-noun pair and the value is a random 5-digit number. The model needs to retrieve the value based on a given key. 
+    \caption{Ablation study of pooling on LongEval-Lines. The evaluation includes inputs, each comprised of lines formatted as "\texttt{line makeshift-penguin: REGISTER\_CONTENT is <10536>}", where the key is an adjective-noun pair and the value is a random 5-digit number. The model needs to retrieve the value based on a given key.
     The x-axis denotes the length of the input; the y-axis indicates the position of the groundtruth, from 5K to 30K tokens. With the pooling, the model can retrieve correct values before 16k and performs significantly better than the one without pooling.
     }
     \label{fig: ablation}
@@ -323,7 +323,7 @@ We perform an ablation study to assess the impact of our pooling technique, a st
 
 \subsection{Experiments on LongBench}
 We evaluate \kv on these four models using LongBench~\cite{bai2023longbench}, a multi-task benchmark designed to rigorously evaluate long context understanding capabilities across various datasets, spanning single and multi-document QA, summarization, few-shot learning, synthetic tasks, and code completion. We choose \texttt{LWM-Text-Chat-1M} with 1 million context length, \texttt{LongChat-7b-v1.5-32k}, \texttt{Mistral-7B-Instruct-v0.2}, \texttt{Mixtral-8x7B-Instruct-v0.1} with 32k context length as our baselines. For each model, we test \kv with various settings: compressing KV caches in the prompt to 1024, 2048, and 4096 tokens. We use max pooling with kernel size 7 and observation window size 32. Table \ref{tab:longbench} illustrates a negligible performance drop from models with \kv compared with original implementations for 16 different datasets, even with prompt-KV with 1024 tokens. Some models even outperform the baseline. Our results substantiate that \kv can grasp the key information in the long context and give comprehensive summaries with details. Moreover, our results also indicate the effectiveness of \kv in compressing the prompt KV cache. For \texttt{LongChat-7b-v1.5-32k}, the average input token length is 12521; for \texttt{LWM-Text-Chat-1M}, 13422; for Mistral, 13160. Thus, using 1024, \kv achieves an average compression rate of 92\%, and using 4096, it reaches 68\%, all with negligible drops in accuracy.
-We compare \kv and H2O on the LongBench dataset to further demonstrate the performance of \kv. To fairly evaluate the accuracy, we set the prompt capacity for H2O to 4096. As table \ref{tab:longbench} shows, \kv delivers significantly better performance than H2O. Even with 1024 prompt KV caches, \kv on \texttt{Mistral-7B-Instruct-v0.2} achieves better performance than H2O with 4096 caches on 11 out of 16 benchmarks. 
+We compare \kv and H2O on the LongBench dataset to further demonstrate the performance of \kv. To fairly evaluate the accuracy, we set the prompt capacity for H2O to 4096. As table \ref{tab:longbench} shows, \kv delivers significantly better performance than H2O. Even with 1024 prompt KV caches, \kv on \texttt{Mistral-7B-Instruct-v0.2} achieves better performance than H2O with 4096 caches on 11 out of 16 benchmarks.
 \subsection{Experiments on Command-R}
 To further assess the performance of \kv, we conduct experiments using Cohere's \texttt{Command-R} model \cite{coherecommandr}, an open-source model with 35B parameters and capable of handling sequences of up to 128k token length. \texttt{Command-R} is designed for complex tasks requiring long context, such as retrieval-augmented generation (RAG). We extensively test \texttt{Command-R} on NarrativeQA and a modified version of the Needle-in-a-Haystack where it achieves promising results. To evaluate \kv's impact on RAG, we ran tests on bioasq \cite{bioasq}, multi-hop question answering with HotpotQA \cite{yang2018hotpotqa}, and an internal benchmark on tool use, which further demonstrated its effectiveness. Throughout all experiments, we limit the KV cache to a maximum of 4096 tokens, while the pooling kernel size and window size are set to 13 and 64, respectively. For our evaluations, these hyper-parameters give a KV cache compression ratio between 2x to 32x depending on the sequence length.
 
@@ -389,7 +389,7 @@ Number of Documents & Approximate Context Length & Ground Truth Position & \% Di
 \end{table}
 As Table \ref{table:commandr_generation} shows, \kv is robust in terms of generation quality and does not suffer from the well-known lost-in-the-middle pathology. Moreover, \kv improves performance over the baseline model when the context contains close to 200 documents. One potential explanation to this is that by adequately compressing the KV cache, we can effectively reduce the noise from negative documents and push the model to construct attention scores more focused on the relevant information.
 
-\paragraph{End-to-End RAG} 
+\paragraph{End-to-End RAG}
 To assess \kv's robustness in a comprehensive manner, we integrated it into a complete RAG pipeline. This evaluation starts by retrieving 200 documents using Cohere's embedding service \cite{cohereembed} in response to a given query. These documents were then re-ranked using Cohere's re-ranking model \cite{coherererank}, which filtered out half of the candidates, resulting in a list of 100 documents. We prompt \texttt{Command-R} using this list and calculate the accuracy metric as described in Section \ref{Generation_Section}. We employed a modified version of the HotpotQA dataset \cite{yang2018hotpotqa} and leveraged Wikipedia as the document source. This setup introduces a more challenging set of documents as all documents, relevant or not, are semantically similar.
 Table \ref{table:commandr_cite} showcases \kv's robust performance in a production-like RAG setting. With an average dataset length of around 16,000 tokens, the KV cache benefits from a compression ratio of approximately 4x.
 
@@ -410,7 +410,7 @@ Empirical results shown in Figure~\ref{fig: medusa} highlight the performance ac
 
 The findings indicate a slowdown in \texttt{Medusa}'s performance as sequence lengths extend, a challenge effectively mitigated by \kv's intervention, which achieved a 1.3x speedup for sequences with 10k length compared to \texttt{Medusa} and a 2.2x speedup compared to the native decoding. This improvement underscores the potential of combining KV cache compression with parallel decoding frameworks to enhance LLM efficiency, particularly in long-context scenarios.
 \section{Discussions}
-\kv emerges as a potent yet straightforward solution, adeptly compressing the KV caches of models to mitigate the computational and memory burdens associated with processing extensive inputs. Originating from a nuanced observation that specific tokens within prompts garner consistent attention from each head during generation, our methodology not only conserves crucial information but also enhances processing efficiency. 
+\kv emerges as a potent yet straightforward solution, adeptly compressing the KV caches of models to mitigate the computational and memory burdens associated with processing extensive inputs. Originating from a nuanced observation that specific tokens within prompts garner consistent attention from each head during generation, our methodology not only conserves crucial information but also enhances processing efficiency.
 % limitation
 Despite its strengths, \kv's scope is primarily confined to the generative aspect of models, specifically targeting the KV caches during the generation. This limitation implies that \kv cannot extend a model's long context capability if the model inherently struggles with long contexts or exhibits poor performance. Additionally, \kv's design does not cover the processing of the prompt inference, which limits its effectiveness in scenarios where the system cannot handle prompts of extensive length.
 Nonetheless, our contributions offer significant insights and tools for the community, paving the way for more refined approaches on managing the challenges of large-scale language modeling.

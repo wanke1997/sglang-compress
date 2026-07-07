@@ -127,9 +127,7 @@ def main():
             print(f"[{i}] gold={gold} pred={pred} ok={ok} ntok={ntok}")
 
     mode = (
-        "serial batch=1"
-        if args.concurrency <= 1
-        else f"concurrency={args.concurrency}"
+        "serial batch=1" if args.concurrency <= 1 else f"concurrency={args.concurrency}"
     )
     print(
         f"\n=== {args.label} ===\n"

@@ -23,7 +23,9 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SNAPKV_DIR = os.path.abspath(
-    os.path.join(_HERE, "..", "..", "..", "python", "sglang", "srt", "mem_cache", "snapkv")
+    os.path.join(
+        _HERE, "..", "..", "..", "python", "sglang", "srt", "mem_cache", "snapkv"
+    )
 )
 
 
@@ -46,9 +48,7 @@ for _pkg in (
         _placeholder.__path__ = []  # mark as package
         sys.modules[_pkg] = _placeholder
 
-_load_by_path(
-    "sglang.srt.mem_cache.snapkv.algo", os.path.join(_SNAPKV_DIR, "algo.py")
-)
+_load_by_path("sglang.srt.mem_cache.snapkv.algo", os.path.join(_SNAPKV_DIR, "algo.py"))
 _integration = _load_by_path(
     "sglang.srt.mem_cache.snapkv.integration",
     os.path.join(_SNAPKV_DIR, "integration.py"),
@@ -130,7 +130,9 @@ class TestAssembleKept(unittest.TestCase):
         return SnapKVCompressor(
             config=cfg,
             req_to_token_pool=MockReqToTokenPool(1, 64, torch.device("cpu")),
-            token_to_kv_pool=MockKVPool(1, 64, 1, 4, torch.device("cpu"), torch.float32),
+            token_to_kv_pool=MockKVPool(
+                1, 64, 1, 4, torch.device("cpu"), torch.float32
+            ),
             kv_allocator=MockAllocator(),
             start_layer=0,
             end_layer=1,
@@ -162,8 +164,12 @@ class TestCompactRequest(unittest.TestCase):
 
         self.r2t_pool = MockReqToTokenPool(4, 64, self.device)
         self.kv_pool = MockKVPool(
-            self.num_layers, self.num_slots, self.head_num, self.head_dim,
-            self.device, self.dtype,
+            self.num_layers,
+            self.num_slots,
+            self.head_num,
+            self.head_dim,
+            self.device,
+            self.dtype,
         )
         self.alloc = MockAllocator()
         cfg = SnapKVConfig(max_capacity_prompt=self.budget, window_size=self.window)
@@ -192,34 +198,49 @@ class TestCompactRequest(unittest.TestCase):
                 vb[s] = pattern + 0.5
 
         self.state = SnapKVRequestState(req_pool_idx=self.req_pool_idx)
-        self.state.req = _MockReq(origin_len=self.seq_len, output_len=0,
-                                  req_pool_idx=self.req_pool_idx)
+        self.state.req = _MockReq(
+            origin_len=self.seq_len, output_len=0, req_pool_idx=self.req_pool_idx
+        )
 
     def test_relocation_free_and_rewrite(self):
         kept_local = torch.tensor([0, 2, 4, 5])
-        src = self.slots[kept_local]              # [10, 12, 14, 15]
-        dst = self.slots[: self.budget]           # [10, 11, 12, 13]
+        src = self.slots[kept_local]  # [10, 12, 14, 15]
+        dst = self.slots[: self.budget]  # [10, 11, 12, 13]
         expected_k = [
             self.kv_pool.get_key_buffer(l)[src].clone() for l in range(self.num_layers)
         ]
         expected_v = [
-            self.kv_pool.get_value_buffer(l)[src].clone() for l in range(self.num_layers)
+            self.kv_pool.get_value_buffer(l)[src].clone()
+            for l in range(self.num_layers)
         ]
 
         self.comp._compact_request(self.state, self.seq_len, kept_local)
 
         for l in range(self.num_layers):
-            self.assertTrue(torch.equal(self.kv_pool.get_key_buffer(l)[dst], expected_k[l]))
-            self.assertTrue(torch.equal(self.kv_pool.get_value_buffer(l)[dst], expected_v[l]))
+            self.assertTrue(
+                torch.equal(self.kv_pool.get_key_buffer(l)[dst], expected_k[l])
+            )
+            self.assertTrue(
+                torch.equal(self.kv_pool.get_value_buffer(l)[dst], expected_v[l])
+            )
         # tail freed once with [14, 15]
         self.assertEqual(len(self.alloc.freed), 1)
         self.assertEqual(sorted(self.alloc.freed[0].tolist()), [14, 15])
         # req_to_token tail cleared, physical length bookkeeping updated
-        self.assertTrue(torch.all(self.r2t_pool.req_to_token[self.req_pool_idx, self.budget:self.seq_len] == 0))
+        self.assertTrue(
+            torch.all(
+                self.r2t_pool.req_to_token[
+                    self.req_pool_idx, self.budget : self.seq_len
+                ]
+                == 0
+            )
+        )
         self.assertEqual(self.state.req.kv_committed_len, self.budget)
         self.assertEqual(self.state.req.kv_allocated_len, self.budget)
         self.assertTrue(self.state.compressed)
-        self.assertEqual(self.comp.pending_length_updates[self.req_pool_idx], self.budget)
+        self.assertEqual(
+            self.comp.pending_length_updates[self.req_pool_idx], self.budget
+        )
 
 
 class TestObserveAndCompactEndToEnd(unittest.TestCase):
@@ -240,13 +261,19 @@ class TestObserveAndCompactEndToEnd(unittest.TestCase):
 
         self.r2t_pool = MockReqToTokenPool(4, 256, self.device)
         self.kv_pool = MockKVPool(
-            self.num_layers, self.num_slots, self.kv_heads, self.head_dim,
-            self.device, self.dtype,
+            self.num_layers,
+            self.num_slots,
+            self.kv_heads,
+            self.head_dim,
+            self.device,
+            self.dtype,
         )
         self.alloc = MockAllocator()
         cfg = SnapKVConfig(
-            max_capacity_prompt=self.budget, window_size=self.window,
-            kernel_size=5, pooling="avgpool",
+            max_capacity_prompt=self.budget,
+            window_size=self.window,
+            kernel_size=5,
+            pooling="avgpool",
         )
         self.comp = SnapKVCompressor(
             config=cfg,
@@ -270,7 +297,9 @@ class TestObserveAndCompactEndToEnd(unittest.TestCase):
             )
 
     def test_prefill_observe_then_compact(self):
-        req = _MockReq(origin_len=self.seq_len, output_len=0, req_pool_idx=self.req_pool_idx)
+        req = _MockReq(
+            origin_len=self.seq_len, output_len=0, req_pool_idx=self.req_pool_idx
+        )
         self.comp.on_request_begin(req)
 
         fb = _MockForwardBatch(
@@ -295,7 +324,9 @@ class TestObserveAndCompactEndToEnd(unittest.TestCase):
         self.assertEqual(self.alloc.freed[0].numel(), self.seq_len - self.budget)
         # physical length shrunk to budget
         self.assertEqual(req.kv_committed_len, self.budget)
-        self.assertEqual(self.comp.pending_length_updates[self.req_pool_idx], self.budget)
+        self.assertEqual(
+            self.comp.pending_length_updates[self.req_pool_idx], self.budget
+        )
         # armed set cleared
         self.assertEqual(len(self.comp._armed), 0)
 
@@ -322,7 +353,9 @@ class TestLifecycleAndPositions(unittest.TestCase):
         return SnapKVCompressor(
             config=cfg,
             req_to_token_pool=MockReqToTokenPool(4, 64, torch.device("cpu")),
-            token_to_kv_pool=MockKVPool(1, 64, 1, 4, torch.device("cpu"), torch.float32),
+            token_to_kv_pool=MockKVPool(
+                1, 64, 1, 4, torch.device("cpu"), torch.float32
+            ),
             kv_allocator=MockAllocator(),
             start_layer=0,
             end_layer=1,

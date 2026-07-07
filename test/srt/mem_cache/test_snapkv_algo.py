@@ -30,8 +30,15 @@ import torch.nn.functional as F
 # full serving stack) to keep this test GPU-free and dependency-light.
 _ALGO_PATH = os.path.join(
     os.path.dirname(__file__),
-    "..", "..", "..",
-    "python", "sglang", "srt", "mem_cache", "snapkv", "algo.py",
+    "..",
+    "..",
+    "..",
+    "python",
+    "sglang",
+    "srt",
+    "mem_cache",
+    "snapkv",
+    "algo.py",
 )
 _spec = importlib.util.spec_from_file_location(
     "snapkv_algo", os.path.abspath(_ALGO_PATH)
@@ -72,17 +79,23 @@ def ref_update_kv(
     attention_mask = mask[None, None, :, :]
     attn_weights[:, :, -window_size:, -window_size:] += attention_mask
 
-    attn_weights = nn.functional.softmax(
-        attn_weights, dim=-1, dtype=torch.float32
-    ).to(query_states.dtype)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query_states.dtype
+    )
     attn_weights_sum = attn_weights[:, :, -window_size:, :-window_size].sum(dim=-2)
     if pooling == "avgpool":
         attn_cache = F.avg_pool1d(
-            attn_weights_sum, kernel_size=kernel_size, padding=kernel_size // 2, stride=1
+            attn_weights_sum,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            stride=1,
         )
     elif pooling == "maxpool":
         attn_cache = F.max_pool1d(
-            attn_weights_sum, kernel_size=kernel_size, padding=kernel_size // 2, stride=1
+            attn_weights_sum,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            stride=1,
         )
     else:
         raise ValueError("Pooling method not supported")
@@ -101,15 +114,15 @@ def ref_update_kv(
 # Tests                                                                        #
 # --------------------------------------------------------------------------- #
 class TestSnapKVParity(unittest.TestCase):
-    def _run(self, bsz, heads, seq_len, head_dim, window, budget, kernel, pooling, dtype):
+    def _run(
+        self, bsz, heads, seq_len, head_dim, window, budget, kernel, pooling, dtype
+    ):
         torch.manual_seed(0)
         q = torch.randn(bsz, heads, seq_len, head_dim, dtype=dtype)
         k = torch.randn(bsz, heads, seq_len, head_dim, dtype=dtype)
         v = torch.randn(bsz, heads, seq_len, head_dim, dtype=dtype)
 
-        ref_k, ref_v = ref_update_kv(
-            k, q, v, window, budget, kernel, pooling
-        )
+        ref_k, ref_v = ref_update_kv(k, q, v, window, budget, kernel, pooling)
         cluster = SnapKVCluster(
             max_capacity_prompt=budget,
             window_size=window,
@@ -119,17 +132,51 @@ class TestSnapKVParity(unittest.TestCase):
         out_k, out_v = cluster.update_kv(k, q, v)
 
         self.assertEqual(out_k.shape, ref_k.shape)
-        self.assertTrue(torch.equal(out_k, ref_k), "compressed K differs from reference")
-        self.assertTrue(torch.equal(out_v, ref_v), "compressed V differs from reference")
+        self.assertTrue(
+            torch.equal(out_k, ref_k), "compressed K differs from reference"
+        )
+        self.assertTrue(
+            torch.equal(out_v, ref_v), "compressed V differs from reference"
+        )
 
     def test_parity_mha_avgpool(self):
-        self._run(1, 4, 128, 16, window=8, budget=32, kernel=5, pooling="avgpool", dtype=torch.float32)
+        self._run(
+            1,
+            4,
+            128,
+            16,
+            window=8,
+            budget=32,
+            kernel=5,
+            pooling="avgpool",
+            dtype=torch.float32,
+        )
 
     def test_parity_mha_maxpool(self):
-        self._run(1, 4, 128, 16, window=8, budget=32, kernel=7, pooling="maxpool", dtype=torch.float32)
+        self._run(
+            1,
+            4,
+            128,
+            16,
+            window=8,
+            budget=32,
+            kernel=7,
+            pooling="maxpool",
+            dtype=torch.float32,
+        )
 
     def test_parity_batch(self):
-        self._run(3, 2, 96, 8, window=16, budget=48, kernel=5, pooling="avgpool", dtype=torch.float32)
+        self._run(
+            3,
+            2,
+            96,
+            8,
+            window=16,
+            budget=48,
+            kernel=5,
+            pooling="avgpool",
+            dtype=torch.float32,
+        )
 
     def test_below_budget_is_noop(self):
         torch.manual_seed(1)

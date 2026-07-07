@@ -48,9 +48,7 @@ for _pkg in (
         _placeholder.__path__ = []  # mark as package
         sys.modules[_pkg] = _placeholder
 
-_load_by_path(
-    "sglang.srt.mem_cache.rkv.algo", os.path.join(_RKV_DIR, "algo.py")
-)
+_load_by_path("sglang.srt.mem_cache.rkv.algo", os.path.join(_RKV_DIR, "algo.py"))
 _integration = _load_by_path(
     "sglang.srt.mem_cache.rkv.integration", os.path.join(_RKV_DIR, "integration.py")
 )
@@ -119,7 +117,9 @@ class TestAssembleKept(unittest.TestCase):
         return RKVCompressor(
             config=cfg,
             req_to_token_pool=MockReqToTokenPool(1, 64, torch.device("cpu")),
-            token_to_kv_pool=MockKVPool(1, 64, 1, 4, torch.device("cpu"), torch.float32),
+            token_to_kv_pool=MockKVPool(
+                1, 64, 1, 4, torch.device("cpu"), torch.float32
+            ),
             kv_allocator=MockAllocator(),
             start_layer=0,
             end_layer=1,
@@ -210,13 +210,12 @@ class TestCompactRequest(unittest.TestCase):
     def test_relocation_free_and_rewrite(self):
         # Keep past tokens {0, 2} plus the window {4, 5}. Ascending.
         kept_local = torch.tensor([0, 2, 4, 5])
-        src = self.slots[kept_local]              # [10, 12, 14, 15]
-        dst = self.slots[: self.budget]           # [10, 11, 12, 13]
+        src = self.slots[kept_local]  # [10, 12, 14, 15]
+        dst = self.slots[: self.budget]  # [10, 11, 12, 13]
 
         # Snapshot the kept slots' KV BEFORE compaction (from src slots).
         expected_k = [
-            self.kv_pool.get_key_buffer(l)[src].clone()
-            for l in range(self.num_layers)
+            self.kv_pool.get_key_buffer(l)[src].clone() for l in range(self.num_layers)
         ]
         expected_v = [
             self.kv_pool.get_value_buffer(l)[src].clone()
@@ -253,12 +252,11 @@ class TestCompactRequest(unittest.TestCase):
         # Keep tokens whose src slots overlap dst heavily to stress the
         # clone-before-write path: keep {1, 3} + window {4, 5}.
         kept_local = torch.tensor([1, 3, 4, 5])
-        src = self.slots[kept_local]              # [11, 13, 14, 15]
-        dst = self.slots[: self.budget]           # [10, 11, 12, 13]  (overlaps src)
+        src = self.slots[kept_local]  # [11, 13, 14, 15]
+        dst = self.slots[: self.budget]  # [10, 11, 12, 13]  (overlaps src)
 
         expected_k = [
-            self.kv_pool.get_key_buffer(l)[src].clone()
-            for l in range(self.num_layers)
+            self.kv_pool.get_key_buffer(l)[src].clone() for l in range(self.num_layers)
         ]
 
         self.comp._compact_request(self.state, self.seq_len, kept_local)

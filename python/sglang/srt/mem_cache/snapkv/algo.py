@@ -73,17 +73,17 @@ def compute_snap_attention(query_states, key_states, window_size, pooling="max")
     window_q = query_states[:, :, -window_size:, :]
 
     if query_group_size == 1:
-        attn_weights = torch.matmul(
-            window_q, key_states.transpose(2, 3)
-        ) / math.sqrt(head_dim)
+        attn_weights = torch.matmul(window_q, key_states.transpose(2, 3)) / math.sqrt(
+            head_dim
+        )
     else:
         window_q = window_q.view(
             batch_size, kv_heads, query_group_size, window_size, head_dim
         )
         keys = key_states.unsqueeze(2)
-        attn_weights = torch.matmul(
-            window_q, keys.transpose(3, 4)
-        ) / math.sqrt(head_dim)
+        attn_weights = torch.matmul(window_q, keys.transpose(3, 4)) / math.sqrt(
+            head_dim
+        )
         if pooling == "mean":
             attn_weights = attn_weights.mean(dim=2)
         elif pooling == "max":
@@ -95,9 +95,9 @@ def compute_snap_attention(query_states, key_states, window_size, pooling="max")
     mask = _causal_window_mask(window_size, attn_weights.dtype, attn_weights.device)
     attn_weights[:, :, -window_size:, -window_size:] += mask[None, None, :, :]
 
-    attn_weights = nn.functional.softmax(
-        attn_weights, dim=-1, dtype=torch.float32
-    ).to(query_states.dtype)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query_states.dtype
+    )
     # Sum the attention each past key receives across observation rows.
     attn_weights_sum = attn_weights[:, :, -window_size:, :-window_size].sum(dim=-2)
     return attn_weights_sum
