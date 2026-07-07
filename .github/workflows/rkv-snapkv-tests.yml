@@ -1,0 +1,43 @@
+name: RKV/SnapKV Tests
+
+# Lightweight, GPU-free CI for the R-KV / SnapKV KV-cache compression port.
+# The upstream SGLang hardware CI (AMD/NPU/XPU/GPU, gated by the `run-ci`
+# label + self-hosted runner fleet) cannot run on this fork, so it was
+# removed. These unit tests exercise the pure algorithm and integration
+# glue on CPU and run on the standard GitHub-hosted ubuntu runner.
+
+on:
+  push:
+    branches: [main, dev-v0.5.14]
+  pull_request:
+    paths:
+      - "python/sglang/srt/mem_cache/rkv/**"
+      - "python/sglang/srt/mem_cache/snapkv/**"
+      - "test/srt/mem_cache/test_rkv_*.py"
+      - "test/srt/mem_cache/test_snapkv_*.py"
+      - ".github/workflows/rkv-snapkv-tests.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rkv-snapkv-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CPU-only dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run RKV/SnapKV unit tests
+        run: |
+          python -m unittest discover -s test/srt/mem_cache -p 'test_*.py' -v
