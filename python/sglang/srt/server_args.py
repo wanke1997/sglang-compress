@@ -1918,6 +1918,19 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # R-KV prefill (prompt-phase KV compression using R-KV importance+redundancy)
+    # -------------------------------------------------------------------------
+    enable_rkv_prefill: A[
+        bool, "Enable R-KV prompt-phase (prefill) KV cache compression"
+    ] = False
+    rkv_prefill_config: A[
+        Optional[str],
+        Arg(
+            help='A dictionary in JSON string format configuring R-KV prefill compression (fields mirror RKVPrefillConfig). Example: \'{"mode": "oneshot", "budget": 1024, "window_size": 32, "mix_lambda": 0.1, "buffer": 512}\'. mode is "oneshot" (route A) or "buffered" (route B).',
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
@@ -2580,6 +2593,8 @@ class ServerArgs:
 
         self._handle_snapkv_validation()
 
+        self._handle_rkv_prefill_validation()
+
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
@@ -3019,6 +3034,50 @@ class ServerArgs:
             raise ValueError("--enable-rkv requires --page-size 1 (per-slot free).")
         if self.tp_size > 1:
             raise ValueError("--enable-rkv does not support tensor parallelism yet.")
+
+    def _handle_rkv_prefill_validation(self):
+        """Enforce the invariants R-KV prefill compression depends on.
+
+        R-KV prefill physically frees prompt KV slots right after prefill (like
+        SnapKV), so it needs prefix caching off, the prefill CUDA graph off
+        (prompt-phase scoring/compaction are dynamic), page_size 1, overlap off,
+        and TP == 1. Decode CUDA graph IS supported (logical positions restored
+        at ForwardBatch construction). It is mutually exclusive with the decode
+        R-KV compressor and with SnapKV (all own physical-length / rotary
+        bookkeeping). ``mode='buffered'`` (route B) does its segmented eviction
+        logically during prefill and one physical compaction at the end, so it
+        supports chunked prefill just like ``oneshot``.
+        """
+        if not self.enable_rkv_prefill:
+            return
+        if self.enable_rkv or self.enable_snapkv:
+            raise ValueError(
+                "--enable-rkv-prefill cannot be combined with --enable-rkv or "
+                "--enable-snapkv."
+            )
+        if not self.disable_radix_cache:
+            raise ValueError(
+                "--enable-rkv-prefill requires --disable-radix-cache: it frees KV "
+                "slots the radix/prefix cache would still reference."
+            )
+        if not (self.disable_prefill_cuda_graph or self.disable_cuda_graph):
+            raise ValueError(
+                "--enable-rkv-prefill requires --disable-prefill-cuda-graph: the "
+                "prompt-phase scoring and compaction are dynamic. (Decode CUDA "
+                "graph is supported and may stay enabled.)"
+            )
+        if not self.disable_overlap_schedule:
+            raise ValueError(
+                "--enable-rkv-prefill requires --disable-overlap-schedule (phase 1)."
+            )
+        if self.page_size not in (None, 1):
+            raise ValueError(
+                "--enable-rkv-prefill requires --page-size 1 (per-slot free)."
+            )
+        if self.tp_size > 1:
+            raise ValueError(
+                "--enable-rkv-prefill does not support tensor parallelism yet."
+            )
 
     def _handle_snapkv_validation(self):
         """Enforce the invariants SnapKV's memory safety depends on.

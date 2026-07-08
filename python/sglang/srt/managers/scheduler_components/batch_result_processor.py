@@ -105,6 +105,13 @@ class SchedulerBatchResultProcessor:
                 )
                 if _snapkv is not None:
                     _snapkv.on_request_end(req)
+                _rkv_prefill = getattr(
+                    getattr(self.model_worker, "model_runner", None),
+                    "rkv_prefill_compressor",
+                    None,
+                )
+                if _rkv_prefill is not None:
+                    _rkv_prefill.on_request_end(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -883,6 +890,13 @@ class SchedulerBatchResultProcessor:
                 )
                 if _snapkv is not None:
                     _snapkv.on_request_end(req)
+                _rkv_prefill = getattr(
+                    getattr(self.model_worker, "model_runner", None),
+                    "rkv_prefill_compressor",
+                    None,
+                )
+                if _rkv_prefill is not None:
+                    _rkv_prefill.on_request_end(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
                 )

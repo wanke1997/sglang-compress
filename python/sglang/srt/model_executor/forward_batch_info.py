@@ -811,6 +811,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             snapkv_comp = getattr(model_runner, "snapkv_compressor", None)
             if snapkv_comp is not None and snapkv_comp.states:
                 snapkv_comp.override_decode_positions(ret)
+            # R-KV prefill: identical rationale — seq_lens tracks the shrunk
+            # physical KV length after prompt compaction; restore logical
+            # positions so eager and CUDA-graph-replay decode both see them.
+            rkv_prefill_comp = getattr(model_runner, "rkv_prefill_compressor", None)
+            if rkv_prefill_comp is not None and rkv_prefill_comp.states:
+                rkv_prefill_comp.override_decode_positions(ret)
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
