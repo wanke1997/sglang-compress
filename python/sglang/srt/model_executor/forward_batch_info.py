@@ -817,6 +817,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rkv_prefill_comp = getattr(model_runner, "rkv_prefill_compressor", None)
             if rkv_prefill_comp is not None and rkv_prefill_comp.states:
                 rkv_prefill_comp.override_decode_positions(ret)
+            # R-KV decode: same again — mid-generation eviction shrinks seq_lens,
+            # so restore logical positions at construction. This is what lets the
+            # decode CUDA graph stay on for R-KV (graph-replay steps copy
+            # forward_batch.positions into the graph input buffer).
+            rkv_comp = getattr(model_runner, "rkv_compressor", None)
+            if rkv_comp is not None and rkv_comp.states:
+                rkv_comp.override_decode_positions(ret)
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.

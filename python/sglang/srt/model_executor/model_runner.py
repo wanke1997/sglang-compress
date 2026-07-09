@@ -3095,10 +3095,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
+            # R-KV decode: advance per-request compaction counters EVERY decode
+            # step (this must run even on graph-replay steps, where the
+            # observe_decode_layer hook inside forward_decode is skipped) and
+            # force this step to run eager when it falls in an observation window
+            # or is a compaction step, so observe + maybe_compact execute.
+            rkv_force_eager = (
+                forward_batch.forward_mode.is_decode()
+                and self.rkv_compressor is not None
+                and self.rkv_compressor.begin_decode_step(forward_batch)
+            )
             can_run_graph = bool(
                 mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                and not rkv_force_eager
             )
 
             if (

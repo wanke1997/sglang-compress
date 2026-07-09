@@ -370,6 +370,7 @@ class TestBatchObserve(unittest.TestCase):
 
         # Feed buffer_size decode steps; each step touches all layers.
         for _ in range(self.buffer_size):
+            self.comp.begin_decode_step(fb)
             for layer_idx in range(self.num_layers):
                 layer = types.SimpleNamespace(layer_id=layer_idx)
                 q = torch.randn(2, self.head_num, self.head_dim)
@@ -379,13 +380,12 @@ class TestBatchObserve(unittest.TestCase):
         self.assertIn(self.long_idx, self.comp._armed)
         self.assertNotIn(self.short_idx, self.comp._armed)
 
-        # begin_step advanced both requests once per step (per-request state).
+        # begin_decode_step advanced only the eligible (long) request; the short
+        # request's seq_len stays below min_seq_len so its clock never starts.
         self.assertEqual(
             self.comp.states[self.long_idx].steps_since_compact, self.buffer_size
         )
-        self.assertEqual(
-            self.comp.states[self.short_idx].steps_since_compact, self.buffer_size
-        )
+        self.assertEqual(self.comp.states[self.short_idx].steps_since_compact, 0)
 
         # Armed request accumulated a per-past-token score of the right shape.
         accum = self.comp.states[self.long_idx].score_accum
@@ -393,11 +393,29 @@ class TestBatchObserve(unittest.TestCase):
         self.assertEqual(accum.shape, (self.long_len - self.window,))
         self.assertIsNone(self.comp.states[self.short_idx].score_accum)
 
+    def test_eager_gating_schedule(self):
+        # begin_decode_step must force EAGER only on the window_size steps ending
+        # at a compaction (so observe can capture queries); other steps may run
+        # on the CUDA graph. window=2, buffer=3 -> first window step at
+        # steps_since_compact==2, compaction at 3.
+        self._build()
+        fb = self._forward_batch()
+        needs = [self.comp.begin_decode_step(fb) for _ in range(self.buffer_size)]
+        self.assertEqual(needs, [False, True, True])
+        # Last step is the compaction step: newest window slot + armed.
+        long_state = self.comp.states[self.long_idx]
+        self.assertEqual(long_state.this_step_window_slot, self.window - 1)
+        self.assertIn(self.long_idx, self.comp._armed)
+        # The short request (below min_seq_len) never forces eager.
+        self.assertEqual(self.comp.states[self.short_idx].this_step_window_slot, -1)
+        self.assertEqual(self.comp.states[self.short_idx].steps_since_compact, 0)
+
     def test_maybe_compact_uses_per_request_seq_len(self):
         self._build()
         torch.manual_seed(1)
         fb = self._forward_batch()
         for _ in range(self.buffer_size):
+            self.comp.begin_decode_step(fb)
             for layer_idx in range(self.num_layers):
                 layer = types.SimpleNamespace(layer_id=layer_idx)
                 q = torch.randn(2, self.head_num, self.head_dim)

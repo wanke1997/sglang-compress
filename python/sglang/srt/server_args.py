@@ -3010,9 +3010,15 @@ class ServerArgs:
 
         See R-KV/doc/DESIGN.md: R-KV physically frees KV slots mid-generation,
         which is incompatible with prefix caching (the radix tree would keep
-        references into freed slots), captured decode CUDA graphs (eviction is
-        dynamic), page_size > 1 (per-slot free), overlap scheduling (phase 1),
-        and TP > 1 (per-rank eviction would diverge).
+        references into freed slots), page_size > 1 (per-slot free), overlap
+        scheduling (phase 1), and TP > 1 (per-rank eviction would diverge).
+
+        Decode CUDA graph IS supported: a per-step hook
+        (``RKVCompressor.begin_decode_step``) advances the compaction counters
+        on every step and forces the ``window_size`` steps ending at each
+        compaction (plus the compaction step) to run eager, while all other
+        decode steps replay the captured graph; logical positions are restored
+        at ForwardBatch construction so graph-replay steps see them too.
         """
         if not self.enable_rkv:
             return
@@ -3020,11 +3026,6 @@ class ServerArgs:
             raise ValueError(
                 "--enable-rkv requires --disable-radix-cache: R-KV frees KV "
                 "slots that the radix/prefix cache would still reference."
-            )
-        if not (self.disable_decode_cuda_graph or self.disable_cuda_graph):
-            raise ValueError(
-                "--enable-rkv requires --disable-decode-cuda-graph: dynamic "
-                "eviction cannot run inside a captured CUDA graph."
             )
         if not self.disable_overlap_schedule:
             raise ValueError(
