@@ -241,6 +241,29 @@ class RKVCompressor:
             )
 
     # ------------------------------------------------------------------
+    # Scheduler admission support
+    # ------------------------------------------------------------------
+    def admission_reserve(self, prompt_len: int, occupied: int) -> int:
+        """Upper bound on the *future* physical KV a request can still consume.
+
+        R-KV holds a request's physical KV cache at a constant ceiling no matter
+        how many tokens it will still generate: it lets the length grow to at
+        most ``max(prompt_len, min_seq_len) + buffer_size`` (the peak reached the
+        step just before a compaction) and then frees back down to ``budget``.
+        So the scheduler only needs to reserve ``ceiling - occupied`` for a
+        request, NOT its full remaining ``max_new_tokens``. Reserving this (much
+        smaller) bound is what lets many more R-KV requests run concurrently.
+
+        The bound is deliberately the pre-compaction PEAK, so it is never an
+        underestimate: a request's physical KV can never exceed it, hence
+        admission can never over-commit the pool (memory-safe). ``occupied`` is
+        the request's current physical KV length (its committed length, or its
+        prompt length before prefill).
+        """
+        ceiling = max(prompt_len, self.config.min_seq_len) + self.config.buffer_size
+        return max(0, ceiling - occupied)
+
+    # ------------------------------------------------------------------
     # Decode-time observation (called per layer from forward_decode)
     # ------------------------------------------------------------------
     def begin_decode_step(self, forward_batch: ForwardBatch) -> bool:

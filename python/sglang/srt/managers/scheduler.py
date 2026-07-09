@@ -2823,6 +2823,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            rkv_compressor=self.rkv_compressor,
         )
 
         if self.chunked_req is not None:

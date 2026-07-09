@@ -440,8 +440,16 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        rkv_compressor=None,
     ):
         self.page_size = page_size
+        # Decode-time R-KV compressor (or None). When set, admission reserves a
+        # request's constant physical KV ceiling (RKVCompressor.admission_reserve)
+        # instead of its full remaining max_new_tokens, so far more compressed
+        # requests can run concurrently. Assigned first because
+        # _get_running_request_total_token_offset (called below on the running
+        # batch) reads it.
+        self.rkv_compressor = rkv_compressor
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -507,6 +515,16 @@ class PrefillAdder:
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
+        if self.rkv_compressor is not None:
+            # R-KV caps a request's physical KV at a constant ceiling regardless
+            # of how many tokens it will still generate; reserve that bound (see
+            # RKVCompressor.admission_reserve) instead of the full remaining
+            # max_new_tokens so the scheduler can admit many more concurrent
+            # requests without ever under-reserving.
+            return self.rkv_compressor.admission_reserve(
+                prompt_len=len(req.origin_input_ids),
+                occupied=req.kv_committed_len,
+            )
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
@@ -514,6 +532,19 @@ class PrefillAdder:
             )
             * self.new_token_ratio
         )
+
+    def _admission_max_new(self, req: Req) -> int:
+        """max_new_tokens estimate used for prefill admission reservation.
+
+        For R-KV requests this is the bounded future physical increment (see
+        RKVCompressor.admission_reserve), computed against the prompt length;
+        otherwise the usual clipped remaining generation length.
+        """
+        if self.rkv_compressor is not None:
+            return self.rkv_compressor.admission_reserve(
+                prompt_len=req.extend_input_len, occupied=req.extend_input_len
+            )
+        return min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
 
     @property
     def rem_total_tokens(self):
@@ -763,13 +794,27 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
-            new_token_ratio = (
-                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-            )
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
-                r.output_ids
-            )
-            tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
+            if self.rkv_compressor is not None:
+                # R-KV bounds physical KV at a constant ceiling; reserve that
+                # (small) future increment and account occupancy by the physical
+                # committed length, not the ever-growing logical length.
+                occupied = (
+                    r.kv_committed_len
+                    if r.kv_committed_len > 0
+                    else len(r.origin_input_ids)
+                )
+                tokens_left = self.rkv_compressor.admission_reserve(
+                    prompt_len=len(r.origin_input_ids), occupied=occupied
+                )
+                tokens_occupied = occupied
+            else:
+                new_token_ratio = (
+                    1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+                )
+                tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
+                    r.output_ids
+                )
+                tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
 
             if tokens_left <= 0:
                 return
@@ -836,7 +881,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                self._admission_max_new(req),
                 req.retracted_stain,
             )
         else:
@@ -885,10 +930,15 @@ class PrefillAdder:
         # _update_prefill_budget already accounts for this in the deduction.
         # Without this, admission is more optimistic than the actual budget
         # deduction, allowing over-admission when the pool is nearly full.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
+        if self.rkv_compressor is not None:
+            max_new = self.rkv_compressor.admission_reserve(
+                prompt_len=req.extend_input_len, occupied=req.extend_input_len
+            )
+        else:
+            max_new = min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
         total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -977,10 +1027,7 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
-                    ),
+                    self._admission_max_new(req),
                     req.retracted_stain,
                 )
             else:
