@@ -3041,8 +3041,12 @@ class ServerArgs:
 
         R-KV prefill physically frees prompt KV slots right after prefill (like
         SnapKV), so it needs prefix caching off, the prefill CUDA graph off
-        (prompt-phase scoring/compaction are dynamic), page_size 1, overlap off,
-        and TP == 1. Decode CUDA graph IS supported (logical positions restored
+        (prompt-phase scoring/compaction are dynamic), page_size 1, and TP == 1.
+        Overlap scheduling IS supported: decode does zero KV mutation (the single
+        prompt compaction happens at prefill end), so decode seq_lens grow
+        monotonically by 1 and the overlap future map stays consistent; the only
+        shrink (prompt_len -> budget) is applied once, before the first decode.
+        Decode CUDA graph IS supported (logical positions restored
         at ForwardBatch construction). It is mutually exclusive with the decode
         R-KV compressor and with SnapKV (all own physical-length / rotary
         bookkeeping). ``mode='buffered'`` (route B) does its segmented eviction
@@ -3067,10 +3071,6 @@ class ServerArgs:
                 "prompt-phase scoring and compaction are dynamic. (Decode CUDA "
                 "graph is supported and may stay enabled.)"
             )
-        if not self.disable_overlap_schedule:
-            raise ValueError(
-                "--enable-rkv-prefill requires --disable-overlap-schedule (phase 1)."
-            )
         if self.page_size not in (None, 1):
             raise ValueError(
                 "--enable-rkv-prefill requires --page-size 1 (per-slot free)."
@@ -3087,11 +3087,12 @@ class ServerArgs:
         after prefill, which is incompatible with prefix caching (the radix tree
         would keep references into freed slots), captured prefill CUDA graphs
         (the prompt-phase scoring and one-time compaction are dynamic), page_size
-        > 1 (per-slot free), overlap scheduling (phase 1), and TP > 1 (per-rank
-        eviction would diverge). Decode CUDA graph and chunked prefill ARE
-        supported: compaction is one-time (before decode) and the only
-        decode-time dynamic (logical rotary positions) is applied at
-        ForwardBatch construction, consumed by both the eager and
+        > 1 (per-slot free), and TP > 1 (per-rank eviction would diverge).
+        Decode CUDA graph, chunked prefill, and overlap scheduling ARE supported:
+        compaction is one-time (before decode), so decode does zero KV mutation
+        and seq_lens grow monotonically by 1 (keeping the overlap future map
+        consistent); the only decode-time dynamic (logical rotary positions) is
+        applied at ForwardBatch construction, consumed by both the eager and
         CUDA-graph-replay paths; the observation-window queries are buffered
         across prefill chunks and scored on the final chunk. Cannot run
         alongside R-KV (both own the physical-length / rotary bookkeeping).
@@ -3113,10 +3114,6 @@ class ServerArgs:
                 "prompt-phase observation and one-time compaction are dynamic "
                 "and cannot run inside a captured prefill CUDA graph. (Decode "
                 "CUDA graph is supported and may stay enabled.)"
-            )
-        if not self.disable_overlap_schedule:
-            raise ValueError(
-                "--enable-snapkv requires --disable-overlap-schedule (phase 1)."
             )
         if self.page_size not in (None, 1):
             raise ValueError("--enable-snapkv requires --page-size 1 (per-slot free).")

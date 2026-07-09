@@ -915,6 +915,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 start_layer=self.start_layer,
                 end_layer=self.start_layer + self.num_effective_layers,
                 device=self.device,
+                enable_overlap=not self.server_args.disable_overlap_schedule,
             )
 
         if self.enable_rkv_prefill:
@@ -938,6 +939,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 start_layer=self.start_layer,
                 end_layer=self.start_layer + self.num_effective_layers,
                 device=self.device,
+                enable_overlap=not self.server_args.disable_overlap_schedule,
             )
 
         self.init_routed_experts_capturer()

@@ -103,6 +103,10 @@ class _MockReq:
         self.req_pool_idx = req_pool_idx
         self.task_type = task_type
 
+    @property
+    def seqlen(self):
+        return len(self.origin_input_ids) + len(self.output_ids)
+
 
 class _MockLayer:
     def __init__(self, layer_id):
@@ -215,6 +219,39 @@ class TestOneShotEndToEnd(unittest.TestCase):
         r2t = comp.req_to_token_pool.req_to_token
         self.assertTrue(bool((r2t[idx, :budget] != 0).all()))
         self.assertTrue(bool((r2t[idx, budget:n] == 0).all()))
+
+    def test_reprefill_after_retract_frees_regenerated_slots(self):
+        # A retracted request keeps its output_ids and re-prefills
+        # origin_input_ids + output_ids, allocating (origin + output) KV slots.
+        # Compaction must free the FULL physical tail, not orphan the
+        # regenerated output slots (KV-pool leak regression).
+        budget, window, origin, output = 8, 2, 20, 12
+        n = origin + output  # physical prefill length after re-prefill
+        num_layers, kv_heads, q_heads, head_dim = 3, 2, 2, 8
+        comp = _make_compressor(
+            "oneshot", budget, window, num_layers, kv_heads, head_dim, num_slots=64
+        )
+        idx = 1
+        slots = torch.arange(30, 30 + n, dtype=torch.int32)
+        comp.req_to_token_pool.req_to_token[idx, :n] = slots
+
+        req = _MockReq(origin_len=origin, output_len=output, req_pool_idx=idx)
+        comp.on_request_begin(req)
+        # prompt_len tracks the full physical length (origin + output).
+        self.assertEqual(comp.states[idx].prompt_len, n)
+
+        fb = _MockForwardBatch([idx], [n], [n])
+        q = torch.randn(n, q_heads, head_dim)
+        for layer_id in range(num_layers):
+            comp.observe_prefill_layer(q, None, None, _MockLayer(layer_id), fb)
+        comp.maybe_compact(fb)
+
+        # Frees the full tail (n - budget); no output slot left orphaned.
+        self.assertEqual(int(comp.kv_allocator.freed[0].numel()), n - budget)
+        r2t = comp.req_to_token_pool.req_to_token
+        self.assertTrue(bool((r2t[idx, budget:n] == 0).all()))
+        self.assertEqual(req.kv_committed_len, budget)
+        self.assertEqual(req.kv_allocated_len, budget)
 
     def test_below_budget_no_compaction(self):
         budget, window, n = 32, 2, 20  # n < budget

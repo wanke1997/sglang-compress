@@ -141,6 +141,7 @@ class SnapKVCompressor:
         start_layer: int,
         end_layer: int,
         device: torch.device,
+        enable_overlap: bool = False,
     ) -> None:
         self.config = config
         self.req_to_token_pool = req_to_token_pool
@@ -150,6 +151,10 @@ class SnapKVCompressor:
         self.end_layer = end_layer
         self.num_layers = end_layer - start_layer
         self.device = device
+        # Under overlap scheduling the just-sampled token is not yet appended to
+        # req.output_ids when the next ForwardBatch is built (one-step delay), so
+        # the logical decode position must NOT subtract the extra 1.
+        self.enable_overlap = enable_overlap
 
         # Active per-request state, keyed by req_pool_idx.
         self.states: Dict[int, SnapKVRequestState] = {}
@@ -180,7 +185,12 @@ class SnapKVCompressor:
             return
         state = SnapKVRequestState(req_pool_idx=req.req_pool_idx)
         state.req = req
-        state.prompt_len = len(req.origin_input_ids)
+        # Full physical prefill length = len(origin_input_ids) + len(output_ids),
+        # NOT just the prompt. A retracted request keeps its output_ids and
+        # re-prefills origin_input_ids + output_ids, allocating that many KV
+        # slots. Keying compaction off the original prompt length would leave the
+        # regenerated output slots orphaned in the pool (KV leak).
+        state.prompt_len = req.seqlen
         self.states[req.req_pool_idx] = state
 
     def on_request_end(self, req: Req) -> None:
@@ -191,6 +201,21 @@ class SnapKVCompressor:
                 req.req_pool_idx,
                 len(self.states),
             )
+
+    def on_request_retract(self, req: Req) -> None:
+        """Drop state on retraction so the re-prefill rebuilds cleanly.
+
+        Must run while ``req_pool_idx`` is still valid (before the pool frees
+        it). A retained state (``compressed=True`` / stale ``observed_seq_len``)
+        would make the re-prefilled request skip compaction or free the wrong
+        tail slots, leaking KV pool memory.
+        """
+        idx = req.req_pool_idx
+        if idx is None:
+            return
+        self.states.pop(idx, None)
+        self.pending_length_updates.pop(idx, None)
+        self._armed.discard(idx)
 
     # ------------------------------------------------------------------
     # Prefill-time observation (called per layer from forward_extend)
@@ -467,4 +492,8 @@ class SnapKVCompressor:
         for i in range(req_indices.shape[0]):
             st = self.states.get(int(req_indices[i].item()))
             if st is not None and st.req is not None:
-                forward_batch.positions[i] = self.logical_position(st.req) - 1
+                # Overlap delays output_ids by one token, so logical_position is
+                # already one short then; drop the -1 in that case.
+                forward_batch.positions[i] = self.logical_position(st.req) - (
+                    0 if self.enable_overlap else 1
+                )

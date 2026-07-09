@@ -105,6 +105,10 @@ class _MockReq:
         self.kv_allocated_len = origin_len + output_len
         self.req_pool_idx = req_pool_idx
 
+    @property
+    def seqlen(self):
+        return len(self.origin_input_ids) + len(self.output_ids)
+
 
 class _MockLayer:
     def __init__(self, layer_id: int):
@@ -329,6 +333,42 @@ class TestObserveAndCompactEndToEnd(unittest.TestCase):
         )
         # armed set cleared
         self.assertEqual(len(self.comp._armed), 0)
+
+    def test_reprefill_after_retract_frees_regenerated_slots(self):
+        # A retracted request keeps its output_ids and re-prefills
+        # origin_input_ids + output_ids, allocating (origin + output) KV slots.
+        # Compaction must free the FULL physical tail, not orphan the
+        # regenerated output slots (KV-pool leak regression).
+        origin, output = self.seq_len, 12
+        n = origin + output  # physical prefill length after re-prefill
+        slots = torch.arange(n, dtype=torch.int32)
+        self.r2t_pool.req_to_token[self.req_pool_idx, :n] = slots
+
+        req = _MockReq(
+            origin_len=origin, output_len=output, req_pool_idx=self.req_pool_idx
+        )
+        self.comp.on_request_begin(req)
+        # prompt_len tracks the full physical length (origin + output).
+        self.assertEqual(self.comp.states[self.req_pool_idx].prompt_len, n)
+
+        fb = _MockForwardBatch(
+            req_pool_indices=[self.req_pool_idx],
+            seq_lens=[n],
+            extend_seq_lens=[n],
+        )
+        torch.manual_seed(11)
+        for layer_id in range(self.num_layers):
+            q = torch.randn(n, self.q_heads, self.head_dim)
+            self.comp.observe_prefill_layer(q, None, None, _MockLayer(layer_id), fb)
+        self.comp.maybe_compact(fb)
+
+        # Frees the full tail (n - budget); no output slot left orphaned.
+        self.assertEqual(len(self.alloc.freed), 1)
+        self.assertEqual(self.alloc.freed[0].numel(), n - self.budget)
+        r2t = self.r2t_pool.req_to_token
+        self.assertTrue(bool((r2t[self.req_pool_idx, self.budget : n] == 0).all()))
+        self.assertEqual(req.kv_committed_len, self.budget)
+        self.assertEqual(req.kv_allocated_len, self.budget)
 
     def test_below_budget_prompt_is_untouched(self):
         short = 10  # < budget
