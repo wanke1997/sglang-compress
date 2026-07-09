@@ -1616,9 +1616,17 @@ def release_req(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
+    rkv_compressor: Optional[Any] = None,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
+
+    # R-KV: drop this request's compressor state while req_pool_idx is still
+    # valid (req_to_token_pool.free below sets it to None). The physical KV is
+    # about to be freed; a retained state would carry a stale compaction counter
+    # / observation window into the request's next prefill+decode.
+    if rkv_compressor is not None:
+        rkv_compressor.on_request_retract(req)
 
     if server_args.disaggregation_mode == "decode":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
@@ -1639,6 +1647,7 @@ def retract_all(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
+    rkv_compressor: Optional[Any] = None,
 ) -> List[Req]:
     retracted_reqs = reqs
     for idx in range(len(reqs)):
@@ -1650,6 +1659,7 @@ def retract_all(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
+            rkv_compressor=rkv_compressor,
         )
     return retracted_reqs
 
@@ -1693,6 +1703,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # HiSparse (engine-level coordinator ref, same across batches)
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    # Decode-time R-KV compressor (engine-level ref, same across batches). Used
+    # by release_req/retract_all to drop a retracted request's compressor state
+    # while its req_pool_idx is still valid.
+    rkv_compressor: Optional[Any] = None
 
     # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
     # Tell whether the current running batch is full so that we can skip
@@ -2455,6 +2470,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            rkv_compressor=self.rkv_compressor,
         )
         self.reqs = []
         return retracted_reqs
@@ -2532,6 +2548,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            rkv_compressor=self.rkv_compressor,
         )
 
     def prepare_encoder_info_decode(self):

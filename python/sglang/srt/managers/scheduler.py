@@ -3047,6 +3047,9 @@ class Scheduler(
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
+        # Give the batch the R-KV compressor ref so retraction (below) can drop a
+        # retracted request's compressor state before its physical KV is freed.
+        batch.rkv_compressor = self.rkv_compressor
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
@@ -4046,6 +4049,7 @@ class Scheduler(
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
+                self.running_batch.rkv_compressor = self.rkv_compressor
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)

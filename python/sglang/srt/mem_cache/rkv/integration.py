@@ -240,6 +240,19 @@ class RKVCompressor:
                 len(self.states),
             )
 
+    def on_request_retract(self, req: Req) -> None:
+        """Discard a retracted request's R-KV state.
+
+        Retraction frees the request's physical KV and sends it back to the
+        waiting queue to be re-prefilled from scratch. Its old state (compaction
+        counter, observation-window queries, physical-length bookkeeping) no
+        longer matches the freed KV, so drop it here; a clean state is rebuilt by
+        ``on_request_begin`` when the request re-enters decode. Must be called
+        while ``req.req_pool_idx`` is still valid, i.e. BEFORE the pool frees it.
+        """
+        if req.req_pool_idx is not None:
+            self.states.pop(req.req_pool_idx, None)
+
     # ------------------------------------------------------------------
     # Scheduler admission support
     # ------------------------------------------------------------------
