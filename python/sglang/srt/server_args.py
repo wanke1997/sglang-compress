@@ -3041,11 +3041,15 @@ class ServerArgs:
 
         R-KV prefill physically frees prompt KV slots right after prefill (like
         SnapKV), so it needs prefix caching off, the prefill CUDA graph off
-        (prompt-phase scoring/compaction are dynamic), page_size 1, and TP == 1.
-        Overlap scheduling IS supported: decode does zero KV mutation (the single
-        prompt compaction happens at prefill end), so decode seq_lens grow
-        monotonically by 1 and the overlap future map stays consistent; the only
-        shrink (prompt_len -> budget) is applied once, before the first decode.
+        (prompt-phase scoring/compaction are dynamic), overlap scheduling off,
+        page_size 1, and TP == 1.
+        Overlap scheduling is NOT supported: the prefill-end compaction frees KV
+        slots from inside the forward (on the forward stream), which races with
+        the overlap scheduler's async next-batch allocation on the same
+        ``free_pages`` tensor (default stream) — a torn read yields garbage slot
+        indices and an illegal memory access at scale. This is the same reason
+        the decode R-KV compressor requires overlap off. (seq_lens / rotary
+        positions are already overlap-correct; the allocator free is the blocker.)
         Decode CUDA graph IS supported (logical positions restored
         at ForwardBatch construction). It is mutually exclusive with the decode
         R-KV compressor and with SnapKV (all own physical-length / rotary
@@ -3071,6 +3075,14 @@ class ServerArgs:
                 "prompt-phase scoring and compaction are dynamic. (Decode CUDA "
                 "graph is supported and may stay enabled.)"
             )
+        if not self.disable_overlap_schedule:
+            raise ValueError(
+                "--enable-rkv-prefill requires --disable-overlap-schedule: the "
+                "prefill-end compaction frees KV slots from inside the forward "
+                "(forward stream), which races with the overlap scheduler's "
+                "async next-batch allocation on the free-list (default stream) "
+                "and causes an illegal memory access at scale."
+            )
         if self.page_size not in (None, 1):
             raise ValueError(
                 "--enable-rkv-prefill requires --page-size 1 (per-slot free)."
@@ -3088,14 +3100,17 @@ class ServerArgs:
         would keep references into freed slots), captured prefill CUDA graphs
         (the prompt-phase scoring and one-time compaction are dynamic), page_size
         > 1 (per-slot free), and TP > 1 (per-rank eviction would diverge).
-        Decode CUDA graph, chunked prefill, and overlap scheduling ARE supported:
-        compaction is one-time (before decode), so decode does zero KV mutation
-        and seq_lens grow monotonically by 1 (keeping the overlap future map
-        consistent); the only decode-time dynamic (logical rotary positions) is
-        applied at ForwardBatch construction, consumed by both the eager and
-        CUDA-graph-replay paths; the observation-window queries are buffered
-        across prefill chunks and scored on the final chunk. Cannot run
-        alongside R-KV (both own the physical-length / rotary bookkeeping).
+        Overlap scheduling is NOT supported: the one-time prompt compaction frees
+        KV slots from inside the forward (forward stream), which races with the
+        overlap scheduler's async next-batch allocation on the same free-list
+        tensor (default stream), causing an illegal memory access at scale (the
+        same reason the decode R-KV compressor requires overlap off). Decode CUDA
+        graph and chunked prefill ARE supported: the only decode-time dynamic
+        (logical rotary positions) is applied at ForwardBatch construction,
+        consumed by both the eager and CUDA-graph-replay paths; the
+        observation-window queries are buffered across prefill chunks and scored
+        on the final chunk. Cannot run alongside R-KV (both own the
+        physical-length / rotary bookkeeping).
         """
         if not self.enable_snapkv:
             return
@@ -3114,6 +3129,14 @@ class ServerArgs:
                 "prompt-phase observation and one-time compaction are dynamic "
                 "and cannot run inside a captured prefill CUDA graph. (Decode "
                 "CUDA graph is supported and may stay enabled.)"
+            )
+        if not self.disable_overlap_schedule:
+            raise ValueError(
+                "--enable-snapkv requires --disable-overlap-schedule: the "
+                "one-time prompt compaction frees KV slots from inside the "
+                "forward (forward stream), which races with the overlap "
+                "scheduler's async next-batch allocation on the free-list "
+                "(default stream) and causes an illegal memory access at scale."
             )
         if self.page_size not in (None, 1):
             raise ValueError("--enable-snapkv requires --page-size 1 (per-slot free).")
