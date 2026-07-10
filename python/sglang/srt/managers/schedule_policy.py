@@ -441,6 +441,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         rkv_compressor=None,
+        prompt_phase_compressor=None,
     ):
         self.page_size = page_size
         # Decode-time R-KV compressor (or None). When set, admission reserves a
@@ -450,6 +451,14 @@ class PrefillAdder:
         # _get_running_request_total_token_offset (called below on the running
         # batch) reads it.
         self.rkv_compressor = rkv_compressor
+        # Prompt-phase compressor (SnapKV or R-KV-prefill), or None. These free
+        # the prompt down to `budget` at the END of prefill, so a request's
+        # steady-state decode footprint is min(prompt, budget) + output. New-
+        # request admission reserves that smaller lifetime footprint (while the
+        # transient full-prompt prefill is gated on cur_rem_tokens), letting far
+        # more compressed requests run concurrently. Mutually exclusive with
+        # rkv_compressor (validated in server_args).
+        self.prompt_phase_compressor = prompt_phase_compressor
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -643,13 +652,26 @@ class PrefillAdder:
         extend_input_len: int,
         max_new_tokens: int,
         retracted_stain: bool,
+        steady_extend_len: Optional[int] = None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
+        # Prompt-phase compressors free the prompt down to `budget` at the end of
+        # prefill, so a request's LIFETIME (decode-time) footprint is
+        # steady_extend_len + max_new, while the prefill still transiently needs
+        # the full extend_input_len. Reserve them on the lifetime vs current
+        # offsets respectively. Defaults to extend_input_len (no compression).
+        if steady_extend_len is None:
+            steady_extend_len = extend_input_len
+        else:
+            steady_extend_len = self.ceil_paged_tokens(steady_extend_len)
+
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
         page_overhead = self.page_size
-        self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
+        self.rem_total_token_offset += (
+            steady_extend_len + max_new_tokens + page_overhead
+        )
         self.cur_rem_token_offset += extend_input_len + page_overhead
         self.rem_input_tokens -= extend_input_len
 
@@ -807,6 +829,22 @@ class PrefillAdder:
                     prompt_len=len(r.origin_input_ids), occupied=occupied
                 )
                 tokens_occupied = occupied
+            elif self.prompt_phase_compressor is not None:
+                # Prompt-phase compaction frees the prompt to budget at prefill
+                # end, so steady occupancy is min(prompt, budget) + output; the
+                # future reservation is the remaining output (decode grows by 1).
+                new_token_ratio = (
+                    1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+                )
+                tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
+                    r.output_ids
+                )
+                tokens_occupied = (
+                    self.prompt_phase_compressor.admission_steady_prompt_len(
+                        len(r.origin_input_ids)
+                    )
+                    + len(r.output_ids)
+                )
             else:
                 new_token_ratio = (
                     1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
@@ -934,12 +972,28 @@ class PrefillAdder:
             max_new = self.rkv_compressor.admission_reserve(
                 prompt_len=req.extend_input_len, occupied=req.extend_input_len
             )
+            total_tokens = req.extend_input_len + max_new + self.page_size
+        elif self.prompt_phase_compressor is not None:
+            # Lifetime (decode-time) footprint after the prefill-end compaction
+            # is min(prompt, budget) + max_new. The prefill itself still needs
+            # the full prompt transiently, so gate that on cur_rem_tokens here;
+            # total_tokens below only covers the compressed lifetime footprint.
+            max_new = min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            steady_prompt = self.prompt_phase_compressor.admission_steady_prompt_len(
+                req.extend_input_len
+            )
+            total_tokens = steady_prompt + max_new + self.page_size
+            if self.ceil_paged_tokens(req.extend_input_len) > self.cur_rem_tokens:
+                return AddReqResult.NO_TOKEN
         else:
             max_new = min(
                 max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
                 CLIP_MAX_NEW_TOKENS,
             )
-        total_tokens = req.extend_input_len + max_new + self.page_size
+            total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
@@ -1029,6 +1083,13 @@ class PrefillAdder:
                     input_tokens,
                     self._admission_max_new(req),
                     req.retracted_stain,
+                    steady_extend_len=(
+                        self.prompt_phase_compressor.admission_steady_prompt_len(
+                            input_tokens
+                        )
+                        if self.prompt_phase_compressor is not None
+                        else None
+                    ),
                 )
             else:
                 # Make sure at least one page is available

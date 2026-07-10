@@ -2824,6 +2824,12 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             rkv_compressor=self.rkv_compressor,
+            # SnapKV / R-KV-prefill are mutually exclusive and both compress the
+            # prompt at prefill end, so admission reserves their smaller
+            # steady-state footprint (min(prompt, budget) + max_new).
+            prompt_phase_compressor=(
+                self.snapkv_compressor or self.rkv_prefill_compressor
+            ),
         )
 
         if self.chunked_req is not None:

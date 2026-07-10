@@ -217,6 +217,19 @@ class SnapKVCompressor:
         self.pending_length_updates.pop(idx, None)
         self._armed.discard(idx)
 
+    def admission_steady_prompt_len(self, prompt_len: int) -> int:
+        """Post-compaction resident prompt length, for compression-aware admission.
+
+        A prompt-phase compressor frees the prompt down to ``max_capacity_prompt``
+        at the end of prefill, so a request's steady-state (decode-time) physical
+        KV is ``min(prompt_len, max_capacity_prompt) + generated_tokens`` — NOT
+        ``prompt_len + ...``. The scheduler reserves this smaller lifetime
+        footprint (while still gating the transient full-prompt prefill on its
+        own), which is what lets many more compressed requests decode
+        concurrently.
+        """
+        return min(prompt_len, self.config.max_capacity_prompt)
+
     # ------------------------------------------------------------------
     # Prefill-time observation (called per layer from forward_extend)
     # ------------------------------------------------------------------
