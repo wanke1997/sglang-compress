@@ -136,10 +136,6 @@ class RKVRequestState:
         # ``begin_decode_step``); -1 means this step is not a window step.
         self.this_step_window_slot: int = -1
 
-        # Transient cross-layer per-token score accumulator, allocated lazily at
-        # the start of a compaction step and cleared afterwards.
-        self.score_accum: Optional[torch.Tensor] = None
-
         # Back-reference to the owning request, so compaction can update its
         # physical-length bookkeeping (kv_committed_len / kv_allocated_len).
         # Duck-typed: only needs kv_committed_len / kv_allocated_len /
@@ -211,6 +207,13 @@ class RKVCompressor:
         # The scheduler drains this (``take_pending_length_updates``) to update
         # the batch-level seq_lens tensors, which it owns.
         self.pending_length_updates: Dict[int, int] = {}
+        # Batched-scoring A/B gate: None = not yet checked, True = batched
+        # selects the same kept set as the per-layer reference (adopted), False
+        # = they differed on the first compaction (per-layer fallback forever).
+        self._batched_ok: Optional[bool] = None
+        # Cap the batched-scoring transient (cosine matrix + mask + indices) so
+        # peak memory stays bounded when budget (=> seq_len) is large.
+        self._score_chunk_bytes: int = 512 << 20
 
     # ------------------------------------------------------------------
     # Request lifecycle
@@ -329,10 +332,9 @@ class RKVCompressor:
                     state.this_step_window_slot = slot
                     need_eager = True
                 if steps >= buffer:
-                    # Compaction step: arm scoring (accumulated in observe over
-                    # this same eager forward, then consumed by maybe_compact).
+                    # Compaction step: arm this request. Scoring is batched
+                    # across all layers in ``maybe_compact`` after the forward.
                     self._armed.add(int(req_pool_idx))
-                    state.score_accum = None
         return need_eager
 
     def observe_decode_layer(
@@ -343,15 +345,16 @@ class RKVCompressor:
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> None:
-        """Capture window queries and (on the compaction step) accumulate scores.
+        """Capture window queries for the observation window.
 
         Called per layer from ``FlashInferAttnBackend.forward_decode`` *after*
         ``set_kv_buffer`` — but only on EAGER decode steps (graph-replayed steps
         skip this Python hook; ``begin_decode_step`` forces window/compaction
         steps to run eager so this executes for them). Counters and arming are
-        owned by ``begin_decode_step``; here we only:
-          * write this layer's query into the observation window (window steps);
-          * on the compaction step (armed), compute + accumulate the layer score.
+        owned by ``begin_decode_step``; here we only write this layer's query
+        into the observation window (on window steps). Scoring is **not** done
+        here — it is batched across all layers in ``maybe_compact`` after the
+        full forward pass (one big GEMM instead of ``num_layers`` small ones).
         """
         # No managed requests => nothing to do. This early return is also what
         # keeps CUDA-graph CAPTURE clean: capture runs dummy decode forwards with
@@ -361,27 +364,15 @@ class RKVCompressor:
             return
         layer_idx = layer.layer_id - self.start_layer
         req_indices = forward_batch.req_pool_indices.tolist()
-        seq_lens_src = forward_batch.seq_lens_cpu
-        if seq_lens_src is None:
-            seq_lens_src = forward_batch.seq_lens
-        seq_lens = seq_lens_src.tolist()
 
         for i, req_pool_idx in enumerate(req_indices):
-            req_pool_idx = int(req_pool_idx)
-            state = self.states.get(req_pool_idx)
+            state = self.states.get(int(req_pool_idx))
             if state is None:
                 continue
 
             # Write this layer's query into the window (no-op off window steps).
             q_i = q[i]
             state.write_window(layer_idx, q_i.reshape(q_i.shape[-2], q_i.shape[-1]))
-
-            if req_pool_idx in self._armed:
-                layer_score = self._layer_score(state, layer_idx, int(seq_lens[i]))
-                if state.score_accum is None:
-                    state.score_accum = layer_score
-                else:
-                    state.score_accum += layer_score
 
     def _layer_score(
         self, state: RKVRequestState, layer_idx: int, seq_len: int
@@ -409,23 +400,117 @@ class RKVCompressor:
         final_score = self.algo._scores(keys, queries)
         return final_score.mean(dim=1).squeeze(0)
 
+    def _reference_scores(self, state: RKVRequestState, seq_len: int) -> torch.Tensor:
+        """Per-layer sequential scoring (the original path; A/B reference).
+
+        Sums the per-layer mean-over-heads scores in layer order, exactly as the
+        old ``observe`` accumulation did. Returns ``(seq_len - window_size,)``.
+        """
+        acc: Optional[torch.Tensor] = None
+        for layer_idx in range(self.num_layers):
+            s = self._layer_score(state, layer_idx, seq_len)
+            acc = s if acc is None else acc + s
+        return acc
+
+    def _batched_scores(self, state: RKVRequestState, seq_len: int) -> torch.Tensor:
+        """Batched scoring over all layers in one GEMM (the optimization).
+
+        Gathers every layer's K for this request, stacks them into a single
+        ``(num_layers, kv_heads, seq_len, head_dim)`` batch, and runs one
+        ``algo._scores`` call (num_layers as the batch dim) instead of
+        ``num_layers`` bsz=1 calls. Cross-head mean, then cross-layer sum in
+        layer order (matching ``_reference_scores``). Chunked over layers so the
+        transient cosine-similarity matrix stays under ``_score_chunk_bytes``.
+        Returns ``(seq_len - window_size,)``.
+        """
+        r2t = self.req_to_token_pool.req_to_token
+        slots = r2t[state.req_pool_idx, :seq_len].long()
+        # window_q: (num_layers, window, q_heads, hd) -> (num_layers, q_heads, window, hd)
+        queries_all = state.window_q.transpose(1, 2).contiguous()
+
+        k0 = self.token_to_kv_pool.get_key_buffer(self.start_layer)
+        kv_heads = k0.shape[1]
+        # cosine matrix (key dtype, x2 for softmax read/write) + bool mask + int32
+        # indices, per element of (kv_heads, seq, seq) -- owner's per-pair budget.
+        per_layer = (2 * k0.element_size() + 1 + 4) * kv_heads * seq_len * seq_len
+        chunk = max(
+            1, min(self.num_layers, self._score_chunk_bytes // max(1, per_layer))
+        )
+
+        acc: Optional[torch.Tensor] = None
+        for c in range(0, self.num_layers, chunk):
+            hi = min(c + chunk, self.num_layers)
+            # (chunk, seq_len, kv_heads, hd) -> (chunk, kv_heads, seq_len, hd)
+            keys = (
+                torch.stack(
+                    [
+                        self.token_to_kv_pool.get_key_buffer(self.start_layer + l)[
+                            slots
+                        ]
+                        for l in range(c, hi)
+                    ]
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+            # (chunk, kv_heads, seq_len - window) -> mean over heads -> (chunk, seq_len - window)
+            layer_scores = self.algo._scores(keys, queries_all[c:hi]).mean(dim=1)
+            # Sum over layers in order (matches the sequential reference).
+            for li in range(layer_scores.shape[0]):
+                s = layer_scores[li]
+                acc = s if acc is None else acc + s
+        return acc
+
     # ------------------------------------------------------------------
     # Compaction (called once after the full forward pass)
     # ------------------------------------------------------------------
     def maybe_compact(self, forward_batch: ForwardBatch) -> None:
-        """Run physical compaction for any request armed this forward pass."""
+        """Run physical compaction for any request armed this forward pass.
+
+        Scoring is batched across all layers here (see ``_batched_scores``). On
+        the first compaction an A/B gate compares the batched kept-set against
+        the per-layer reference; if they differ it falls back to the per-layer
+        path permanently (protecting accuracy).
+        """
         if not self._armed:
             return
 
         seq_len_by_req = self._seq_len_by_req(forward_batch)
         for req_pool_idx in list(self._armed):
             state = self.states.get(req_pool_idx)
-            if state is None or state.score_accum is None:
+            if state is None or state.window_q is None:
                 continue
             seq_len = seq_len_by_req.get(req_pool_idx)
             if seq_len is None:
                 continue
-            kept = self._assemble_kept(state.score_accum, seq_len)
+
+            if self._batched_ok is None:
+                ref_kept = self._assemble_kept(
+                    self._reference_scores(state, seq_len), seq_len
+                )
+                bat_kept = self._assemble_kept(
+                    self._batched_scores(state, seq_len), seq_len
+                )
+                same_shape = ref_kept.shape == bat_kept.shape
+                self._batched_ok = bool(same_shape and torch.equal(ref_kept, bat_kept))
+                logger.info(
+                    "R-KV batched-scoring gate: %s (kept diff=%s)",
+                    (
+                        "OK -> batched adopted"
+                        if self._batched_ok
+                        else "DIFFER -> per-layer fallback"
+                    ),
+                    int((ref_kept != bat_kept).sum()) if same_shape else "shape",
+                )
+                kept = bat_kept if self._batched_ok else ref_kept
+            else:
+                score = (
+                    self._batched_scores(state, seq_len)
+                    if self._batched_ok
+                    else self._reference_scores(state, seq_len)
+                )
+                kept = self._assemble_kept(score, seq_len)
+
             self._compact_request(state, seq_len, kept)
 
         self._armed.clear()
