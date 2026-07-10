@@ -44,6 +44,28 @@ for _pkg in (
         _ph.__path__ = []
         sys.modules[_pkg] = _ph
 
+# prefill_integration.py declares its config as a ``msgspec.Struct`` (repo
+# convention, see .claude/rules/no-dataclasses.md). msgspec is a real SGLang
+# runtime dependency, but this suite is GPU-free and installs only torch, so it
+# may be absent. Provide a tiny stand-in backed by ``dataclasses`` when it is:
+# the Struct uses only plain-typed fields with immutable defaults plus a
+# ``__post_init__``, all of which dataclasses reproduce exactly. Mirrors the
+# ``sglang.*`` placeholder packages above.
+try:
+    import msgspec  # noqa: F401
+except ModuleNotFoundError:
+    import dataclasses
+
+    _msgspec_stub = types.ModuleType("msgspec")
+
+    class _Struct:
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__(**kwargs)
+            dataclasses.dataclass(cls)
+
+    _msgspec_stub.Struct = _Struct
+    sys.modules["msgspec"] = _msgspec_stub
+
 _load_by_path("sglang.srt.mem_cache.rkv.algo", os.path.join(_RKV_DIR, "algo.py"))
 _load_by_path("sglang.srt.mem_cache.rkv.prefill", os.path.join(_RKV_DIR, "prefill.py"))
 _integration = _load_by_path(
