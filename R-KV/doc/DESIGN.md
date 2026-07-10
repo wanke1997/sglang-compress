@@ -5,6 +5,13 @@ the R-KV port. It captures the architecture research and design decisions that
 are **not** obvious from the code alone. Read this first before touching the
 integration layer.
 
+> **Scope: decode-time R-KV.** This doc covers the original *decoding-time* R-KV
+> (`--enable-rkv`). R-KV also has a **prefill-time** mode (`--enable-rkv-prefill`,
+> code in [`prefill.py`](../../python/sglang/srt/mem_cache/rkv/prefill.py) /
+> [`prefill_integration.py`](../../python/sglang/srt/mem_cache/rkv/prefill_integration.py));
+> its design, results and roadmap are in
+> [`FINDINGS_AND_ROADMAP.md`](./FINDINGS_AND_ROADMAP.md).
+
 ## 1. Goal
 
 Port **R-KV** (Redundancy-aware KV Cache Compression for reasoning models,

@@ -7,6 +7,12 @@ findings, rejected alternatives, the `sparsity/` framework evaluation), read
 the components, the per-step data flow, the exact wiring points, and the
 decisions baked into them.
 
+> **Scope: decode-time R-KV.** This file documents the *decoding-time* path
+> (`--enable-rkv`). The **prefill-time** mode (`--enable-rkv-prefill`) is a
+> separate integration
+> ([`prefill_integration.py`](../../python/sglang/srt/mem_cache/rkv/prefill_integration.py));
+> see [`FINDINGS_AND_ROADMAP.md`](./FINDINGS_AND_ROADMAP.md).
+
 ## 1. Overview
 
 R-KV is a **decoding-time** KV-cache compressor. While a model generates a long

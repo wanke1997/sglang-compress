@@ -7,6 +7,11 @@ It compares an SGLang server **with R-KV on vs off** on a GSM8K-style math
 harness (few-shot MATH prompts with a `#### N` gold answer), talking to the
 server over the `/generate` HTTP API and judging with simple numeric matching.
 
+> **Scope: decode-time R-KV.** This suite benchmarks the *decoding-time* mode
+> (`--enable-rkv`) on math reasoning. The **prefill-time** mode
+> (`--enable-rkv-prefill`) is benchmarked on a summarisation task — see
+> [`../doc/FINDINGS_AND_ROADMAP.md`](../doc/FINDINGS_AND_ROADMAP.md).
+
 ## Layout
 
 | File | Purpose |

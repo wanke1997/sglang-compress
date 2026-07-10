@@ -1,31 +1,51 @@
-# R-KV — Decoding-Time KV Cache Compression for SGLang v0.5.14
+# R-KV — Importance + Redundancy KV Cache Compression (SGLang v0.5.14)
 
-**R-KV** is a *decoding-time* KV-cache compressor. While a model generates a
-long output (e.g. chain-of-thought), R-KV periodically evicts the **unimportant**
-and **redundant** past tokens, keeping only a fixed `budget` of KV entries per
-request — freeing GPU memory while preserving generation quality.
+**R-KV** scores every past KV token by **importance** (attention over a recent
+observation window) and **redundancy** (key cosine-similarity), keeps only a
+fixed `budget` of tokens per request, and **physically frees** the rest from
+SGLang's paged KV pool. It ships in **two modes**:
 
-This directory holds the docs and benchmark for the R-KV port; the code lives in
-[`python/sglang/srt/mem_cache/rkv/`](../python/sglang/srt/mem_cache/rkv/).
+- **Decode-time** (`--enable-rkv`) — the original R-KV. While a model generates a
+  long output (e.g. chain-of-thought), R-KV re-scores and evicts every
+  `buffer_size` steps, holding the decode KV at a constant `budget`. Best for
+  **long reasoning**: short prompt, long output.
+- **Prefill-time** (`--enable-rkv-prefill`) — compress the **prompt** once at the
+  end of prefill (`oneshot`) or in bounded chunks during prefill (`buffered`),
+  then decode against the smaller cache. Same shape as SnapKV, but with R-KV's
+  importance+redundancy scoring. Best for **long context**: long prompt, short
+  output (e.g. summarisation).
 
-- **Algorithm** —
-  [`python/sglang/srt/mem_cache/rkv/algo.py`](../python/sglang/srt/mem_cache/rkv/algo.py):
-  joint scoring of *importance* (attention over a recent observation window) and
-  *redundancy* (key cosine-similarity); keep the top `budget` tokens per request.
-- **Integration** —
-  [`python/sglang/srt/mem_cache/rkv/integration.py`](../python/sglang/srt/mem_cache/rkv/integration.py):
-  true physical eviction in SGLang's paged KV pool (relocate surviving slots,
-  `free()` the rest, rewrite `req_to_token`) with rotary positions kept
-  consistent after the sequence physically shrinks. Runs on the FlashInfer
-  decode path.
-- **Docs** — design notes in [`doc/`](doc/) (`DESIGN.md`, `IMPLEMENTATION.md`,
-  `RETRO_old_vs_new.md`).
-- **Benchmark** — the accuracy/speed suite in [`benchmark/`](benchmark/) and the
-  measured numbers in [`benchmark/RESULTS.md`](benchmark/RESULTS.md),
-  [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md),
-  [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md).
+This directory's docs and benchmark below focus on the **decode-time** mode; the
+**prefill-time** mode's design, results and roadmap live in
+[`doc/FINDINGS_AND_ROADMAP.md`](doc/FINDINGS_AND_ROADMAP.md). Code for both is in
+[`python/sglang/srt/mem_cache/rkv/`](../python/sglang/srt/mem_cache/rkv/):
 
-## Headline result — Qwen2.5-Math-7B-Instruct (single NVIDIA H100)
+- **Decode-time algorithm** —
+  [`algo.py`](../python/sglang/srt/mem_cache/rkv/algo.py): joint scoring of
+  *importance* (attention over a recent observation window) and *redundancy* (key
+  cosine-similarity); keep the top `budget` tokens per request.
+- **Decode-time integration** —
+  [`integration.py`](../python/sglang/srt/mem_cache/rkv/integration.py): true
+  physical eviction in SGLang's paged KV pool (relocate surviving slots, `free()`
+  the rest, rewrite `req_to_token`) with rotary positions kept consistent after
+  the sequence physically shrinks. Runs on the FlashInfer decode path.
+- **Prefill-time algorithm + integration** —
+  [`prefill.py`](../python/sglang/srt/mem_cache/rkv/prefill.py) /
+  [`prefill_integration.py`](../python/sglang/srt/mem_cache/rkv/prefill_integration.py):
+  the same joint score applied to the **prompt** at prefill end — `oneshot`
+  (route A, the accuracy oracle) or `buffered` (route B, bounds the O(n²)
+  similarity). A/B diff-test: [`benchmark/rkv_prefill_ab.py`](benchmark/rkv_prefill_ab.py).
+- **Docs** — decode design notes in [`doc/`](doc/) (`DESIGN.md`,
+  `IMPLEMENTATION.md`, `RETRO_old_vs_new.md`); **prefill** design, results &
+  roadmap in [`doc/FINDINGS_AND_ROADMAP.md`](doc/FINDINGS_AND_ROADMAP.md).
+- **Benchmark** — decode accuracy/speed suite in [`benchmark/`](benchmark/)
+  ([`RESULTS.md`](benchmark/RESULTS.md),
+  [`RESULTS_math7b.md`](benchmark/RESULTS_math7b.md),
+  [`RESULTS_dp.md`](benchmark/RESULTS_dp.md)); the prefill mode is benchmarked on
+  a summarisation task (see
+  [`doc/FINDINGS_AND_ROADMAP.md`](doc/FINDINGS_AND_ROADMAP.md)).
+
+## Headline result — decode mode, Qwen2.5-Math-7B-Instruct (single NVIDIA H100)
 
 GSM8K (200 questions, 5-shot, `max_new_tokens=512`), **decode CUDA graph ON**,
 `budget=512, window=8, buffer=16`:
@@ -45,17 +65,22 @@ eager-path numbers): [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md
 
 ---
 
-## How R-KV works (and how it differs from SnapKV)
+## R-KV modes vs SnapKV
 
-Both keep a fixed KV budget per request and physically free the rest, but fire
-at different points in a request's life:
+All three keep a fixed KV budget per request and physically free the rest; they
+differ in **when** they fire and **what** they compress:
 
-| | **R-KV** (this dir) | **SnapKV** ([`../SnapKV`](../SnapKV/)) |
-| --- | --- | --- |
-| When | **repeatedly**, during decode | **once**, at the end of prefill |
-| Target | the long generated **output** (CoT) | the long **prompt** |
-| Score | importance (attention) − redundancy (key similarity) | observation-window attention + pooling |
-| Best for | long reasoning (short input, long output) | long-context QA / summarisation (long input, short output) |
+| | **R-KV decode** (`--enable-rkv`) | **R-KV prefill** (`--enable-rkv-prefill`) | **SnapKV** ([`../SnapKV`](../SnapKV/)) |
+| --- | --- | --- | --- |
+| When | repeatedly, during decode | once at prefill end (or chunked) | once, at prefill end |
+| Target | the generated **output** (CoT) | the **prompt** | the **prompt** |
+| Score | importance − redundancy | importance − redundancy | window attention + pooling |
+| Best for | long reasoning (short in, long out) | long context (long in, short out) | long context (long in, short out) |
+
+**R-KV prefill** and **SnapKV** occupy the same niche (compress a long prompt);
+R-KV prefill adds the redundancy term at an extra O(n²) scoring cost. See
+[`doc/FINDINGS_AND_ROADMAP.md`](doc/FINDINGS_AND_ROADMAP.md) for the head-to-head
+and the summarisation results.
 
 ## Usage
 
