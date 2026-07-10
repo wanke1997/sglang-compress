@@ -54,6 +54,56 @@ flags without `--enable-rkv` (`--disable-radix-cache --disable-overlap-schedule
 
 ---
 
+## Tuning sweep: `budget` × `buffer_size` (2026-07-10, decode CUDA graph ON)
+
+**Setup.** `Qwen2.5-Math-7B-Instruct`, single H100 (`--mem-fraction-static 0.85`),
+GSM8K **200 questions**, `--concurrency 32`, `max_new_tokens=512`, `temperature=0`,
+`window_size=8`, decode CUDA graph ON. Prompt ≈ **697 tokens** (measured, min 663 /
+max 765) + ~166 output → **full-KV footprint ≈ 863 tokens/request**. Baseline is the
+same flags without `--enable-rkv`.
+
+| `budget` | `buffer_size` | Accuracy (200) | avg tok | Throughput | Compactions | Steady KV saving | Concurrency ceiling |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| full-KV | — | **92.0%** | 166 | **2363 tok/s** | 0 | 0% | 1.0× |
+| 512 | 128 | **91.5%** | 165 | 1331 | 149 | 41% | 1.7× |
+| 512 | 16 | 90.5% | 167 | 541 | 1980 | 41% | 1.7× |
+| 256 | 128 | **90.0%** | 180 | 1344 | 166 | **70%** | **3.4×** |
+| 256 | 16 | 88.5% | 186 | 530 | 2216 | 70% | 3.4× |
+| 128 | 128 | 83.0% | 165 | 1352 | 152 | 85% | 6.7× |
+| 128 | 16 | 68.5% | 236 | 552 | 2828 | 85% | 6.7× |
+
+(Steady KV saving `= 1 − budget/863`; concurrency ceiling `= 863/budget` — how many
+× more requests the same KV pool holds when memory-bound.)
+
+**The two knobs are orthogonal.**
+
+1. **Throughput is set by `buffer_size`, not `budget`.** `buffer_size=16` gives
+   ~540 tok/s and `buffer_size=128` gives ~1340 tok/s (2.5×) at *every* budget,
+   because compaction frequency = `output_len / buffer_size` and the cost is
+   dominated by the forced-eager window/compaction steps, not the scoring
+   arithmetic. Confirmed by the extremes: `buffer_size=512` → **0 compactions** →
+   2213 tok/s = 94% of baseline (so R-KV's per-step fixed cost is only ~6%), while a
+   full-eager `buffer_size=16` run gives 555 tok/s ≈ the hybrid-graph 541 — at high
+   compaction frequency the CUDA graph barely helps.
+2. **Accuracy and memory are set by `budget`.** `budget=512` is lossless (−41% KV),
+   `budget=256` near-lossless (90.0% vs 92.0%, −70% KV), `budget=128` collapses
+   (68–83%, with runaway generation — avg_tok 236). For this ~700-token prompt,
+   **`budget=256` is the lossless wall.**
+
+**Sweet spot: `budget=256, buffer_size=128`** — near-lossless (90.0%), ~57% of
+baseline throughput, ~70% less KV per request (≈3.4× concurrency ceiling).
+`budget=512, buffer_size=128` is the conservative fully-lossless choice (−41% KV).
+Avoid `buffer_size=16` (halves throughput for almost no extra saving) and
+`budget=128` (past the accuracy wall).
+
+> **Caveat — this run is not memory-bound.** At `--concurrency 32` with ~860-token
+> sequences the KV pool (~981k tokens) is far from full, so the "KV saving" column
+> is a *footprint / concurrency ceiling*, not a realised throughput gain. To turn
+> the saving into aggregate throughput you need a memory-bound setting (small pool,
+> long sequences, or high concurrency) where full-KV queues/OOMs and R-KV does not.
+
+---
+
 ## B. Phase-1 eager-path sweep (historical, n=20)
 
 > These numbers predate decode-CUDA-graph support; R-KV and the baseline both ran

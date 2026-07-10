@@ -20,7 +20,7 @@ server over the `/generate` HTTP API and judging with simple numeric matching.
 | `prepare_data.sh` | Pull the eval dataset (`test.jsonl`) from the `dev` branch |
 | `eval.py` | Drive the server over `/generate`, extract answers, report accuracy + throughput (use `--concurrency N` for server-side batch>1) |
 | `RESULTS.md` | Numbers we measured on Qwen2.5-0.5B-Instruct (H100) |
-| `RESULTS_math7b.md` | Numbers we measured on Qwen2.5-Math-7B-Instruct (H100) |
+| `RESULTS_math7b.md` | Numbers we measured on Qwen2.5-Math-7B-Instruct (H100), incl. the `budget`×`buffer_size` tuning sweep |
 | `RESULTS_dp.md` | Data-parallel (`--dp-size N`) correctness + throughput scaling (up to 8× H100) |
 
 ## Prerequisites
@@ -75,6 +75,60 @@ restored at `ForwardBatch` construction so graph-replay steps stay correct). So 
 **fair** speed comparison uses the `baseline` mode (same flags, CUDA graph on, no
 `--enable-rkv`); `baseline-production` additionally re-enables the radix cache for
 a full-production reference.
+
+## Tuning R-KV: `budget` vs `buffer_size`
+
+Decode-time R-KV is controlled by the `--rkv-config` JSON (fields map 1:1 to
+`RKVConfig` in [`rkv/integration.py`](../../python/sglang/srt/mem_cache/rkv/integration.py)).
+`launch_server.sh` exposes the three knobs you actually tune and leaves the rest
+at their reference defaults:
+
+| Field | Set via `launch_server.sh` | Script default | Meaning |
+| --- | --- | --- | --- |
+| `budget` | positional: `./launch_server.sh rkv <budget>` | 512 | **How much** KV survives each compaction — compression *strength* |
+| `buffer_size` | `BUFFER=<n>` env | 16 | **How often** compaction fires — once every `buffer_size` generated tokens |
+| `window_size` | `WINDOW=<n>` env | 8 | Trailing observation-window queries used to score token importance |
+
+Other `RKVConfig` fields (`kernel_size=7`, `mix_lambda=0.1`, `retain_ratio=0.1`)
+keep the reference defaults; to change them, pass a full `--rkv-config` JSON
+yourself instead of using the script.
+
+> ⚠️ The script defaults `BUFFER=16`, but `RKVConfig.buffer_size` defaults to
+> **128** — always set `BUFFER` explicitly if you care about throughput.
+
+**Mental model — the two knobs are (almost) orthogonal:**
+
+- **`budget` = compress to *how much*.** The steady KV footprint per request is
+  `budget` tokens, so a smaller budget saves more memory but evicts more context
+  (accuracy risk). *This is the memory / accuracy axis.*
+- **`buffer_size` = compress *how often*.** The number of decode steps between
+  compactions. Larger `buffer_size` = rarer compaction = fewer forced-eager steps
+  = higher throughput, at the cost of a higher *peak* footprint
+  (`budget + buffer_size`). *This is the throughput axis.*
+
+**How compaction fires.** Once a request's KV length reaches `budget`, R-KV counts
+decode steps and every `buffer_size` steps it scores the past tokens and frees KV
+back down to `budget`. The physical KV length is therefore a sawtooth between
+`budget` and `budget + buffer_size` — this is the `phys 528 -> 512` you see in the
+server log at `budget=512, buffer_size=16`. The `window_size` steps ending at each
+compaction run eager (they collect the scoring queries); constraint:
+`buffer_size >= window_size`.
+
+**Choosing values** (Qwen2.5-Math-7B, GSM8K, ~700-token prompt; full sweep in
+[`RESULTS_math7b.md`](./RESULTS_math7b.md)):
+
+- **Throughput ← `buffer_size`** (not budget): `BUFFER=16` ≈ 540 tok/s vs
+  `BUFFER=128` ≈ 1340 tok/s (2.5×), roughly independent of budget. Use
+  `BUFFER>=128`; `BUFFER=16` halves throughput for almost no extra memory saving.
+- **Accuracy / memory ← `budget`**: `budget=512` is lossless (−41% KV),
+  `budget=256` near-lossless (90% vs 92%, −70% KV), `budget=128` collapses. For
+  this prompt length `budget=256` is the lossless wall.
+- **Sweet spot:** `BUFFER=128 ./launch_server.sh rkv 256` — near-lossless, ~57% of
+  baseline throughput, ~70% less KV per request.
+
+```bash
+BUFFER=128 ./launch_server.sh rkv 256   # sweet spot: budget=256, buffer_size=128
+```
 
 ## Judging
 
