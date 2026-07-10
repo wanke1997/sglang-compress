@@ -24,16 +24,6 @@ request — **freeing GPU memory while preserving generation quality**.
   [`R-KV/doc/`](R-KV/doc/) (`DESIGN.md`, `IMPLEMENTATION.md`) and the evaluation
   suite in [`R-KV/benchmark/`](R-KV/benchmark/).
 
-> **Also included: [SnapKV](SnapKV/) — prompt-phase compression.** Where R-KV
-> compresses the long *output* during decode, SnapKV compresses the long
-> *prompt* once at the end of prefill (keeping the tokens the trailing question
-> attends to). Same paged-pool eviction machinery; enable with `--enable-snapkv`.
-> On Qwen2.5-0.5B a **16 405-token** prompt compresses **64×** to a 256-token
-> budget and a needle passkey is still retrieved at every depth. Code:
-> [`python/sglang/srt/mem_cache/snapkv/`](python/sglang/srt/mem_cache/snapkv/);
-> usage + parameters: [`SnapKV/README.md`](SnapKV/README.md); results:
-> [`SnapKV/benchmark/RESULTS.md`](SnapKV/benchmark/RESULTS.md).
-
 ## Headline result — Qwen2.5-Math-7B-Instruct (single NVIDIA H100)
 
 GSM8K-style math harness, 20 items, few-shot prompt ≈700 tokens, `temperature=0`
