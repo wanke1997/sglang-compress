@@ -38,7 +38,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_ARTICLE = os.path.join(_HERE, "data", "snapkv.txt")
 
 
-def chat(port, content, max_tokens, model="/data/model/Qwen2.5-0.5B-Instruct"):
+def chat(
+    port,
+    content,
+    max_tokens,
+    model="/data/model/Qwen2.5-0.5B-Instruct",
+    task_type="summarization",
+):
     body = json.dumps(
         {
             "model": model,
@@ -47,10 +53,16 @@ def chat(port, content, max_tokens, model="/data/model/Qwen2.5-0.5B-Instruct"):
             "max_tokens": max_tokens,
         }
     ).encode()
+    headers = {"Content-Type": "application/json"}
+    # Prompt-phase KV compression (SnapKV / R-KV-prefill) is gated on the
+    # `task_type` HTTP header; without it the server keeps full KV. Send it so
+    # the benchmark actually exercises compression (empty string = full KV).
+    if task_type:
+        headers["task_type"] = task_type
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=600) as resp:
         out = json.loads(resp.read())
@@ -98,6 +110,12 @@ def main():
     )
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--model", default="/data/model/Qwen2.5-0.5B-Instruct")
+    ap.add_argument(
+        "--task-type",
+        default="summarization",
+        help="task_type HTTP header that opts the request into prompt-phase KV "
+        "compression (empty string => full KV / baseline).",
+    )
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
 
@@ -122,7 +140,9 @@ def main():
     content = doc + question
 
     t0 = time.time()
-    answer, ptok, ctok = chat(args.port, content, args.max_tokens, args.model)
+    answer, ptok, ctok = chat(
+        args.port, content, args.max_tokens, args.model, args.task_type
+    )
     dt = time.time() - t0
 
     print(f"=== {args.label or args.mode} (port {args.port}) ===")
