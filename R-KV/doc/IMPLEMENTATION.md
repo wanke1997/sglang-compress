@@ -171,9 +171,10 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
    subtract 1 (see §5).
 5. **No startup validation of R-KV-incompatible flags (owner review, 2026-07-02).**
    `--enable-rkv` silently corrupted the KV pool when combined with the radix
-   cache, a captured decode CUDA graph, overlap scheduling, `page_size > 1`, or
-   `tp > 1`. Fix: `ServerArgs._handle_rkv_validation` now rejects those combos at
-   startup with an explicit error.
+   cache, overlap scheduling, `page_size > 1`, or `tp > 1`. Fix:
+   `ServerArgs._handle_rkv_validation` now rejects those combos at startup with an
+   explicit error. (Decode CUDA graph was **later made compatible** via the
+   hybrid eager/graph path and is no longer rejected.)
 
 ## 9. Environment (dev-v0.5.14 needs a newer stack than v0.5.3-era wheels)
 
@@ -185,16 +186,18 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
 
 ## 10. Running & validation
 
-Launch (phase-1 flags are required — R-KV runs only on the **eager decode**
-path, so decode CUDA graph must be off; `page_size=1` for clean slot free;
-overlap off for simple timing):
+Launch (required flags — radix cache off so R-KV can free slots, overlap off,
+`page_size=1` for clean slot free). **Decode CUDA graph is supported and left on**
+via the hybrid eager/graph path (the `window_size` steps ending at each
+compaction, plus the compaction step, run eager; every other decode step replays
+the captured graph). Pass `--disable-decode-cuda-graph` only if you want the
+fully-eager path:
 
 ```bash
 PYTHONPATH=$PWD/python HF_HUB_DISABLE_XET=1 python3 -m sglang.launch_server \
   --model-path /data/model/Qwen2.5-0.5B-Instruct \
   --attention-backend flashinfer \
-  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
-  --disable-overlap-schedule --page-size 1 \
+  --disable-radix-cache --disable-overlap-schedule --page-size 1 \
   --enable-rkv --rkv-config '{"budget":64,"window_size":8,"buffer_size":16}' \
   --mem-fraction-static 0.6 --host 127.0.0.1 --port 30000
 ```

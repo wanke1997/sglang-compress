@@ -27,17 +27,21 @@ This directory holds the docs and benchmark for the R-KV port; the code lives in
 
 ## Headline result — Qwen2.5-Math-7B-Instruct (single NVIDIA H100)
 
-GSM8K-style math harness, 20 items, `window=8`, `buffer=16`, `max_new_tokens=512`.
+GSM8K (200 questions, 5-shot, `max_new_tokens=512`), **decode CUDA graph ON**,
+`budget=512, window=8, buffer=16`:
 
-| Config | Accuracy (20) | Compactions |
-| --- | --- | --- |
-| baseline (R-KV off) | 95% (19/20) | — |
-| **R-KV, budget=512** | **95% (19/20)** | ~230 |
-| R-KV, budget=256 | 95% (19/20) | 227 |
+| Config | Accuracy (200) | Total time | Throughput | Compactions |
+| --- | --- | --- | --- | --- |
+| Full-KV baseline | 90.0% | 12.1 s | 1817 tok/s | — |
+| **R-KV decode** | **91.5%** | 43.0 s | 510 tok/s | 1263 |
 
-R-KV keeps full accuracy even though `budget < prompt` (so it evicts part of the
-few-shot prompt too), while running hundreds of physical compactions with no
-crash. Full report: [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md).
+Accuracy is **lossless** (91.5% vs 90.0%, within n=200 judge noise) and R-KV runs
+**with CUDA graph** (1263 physical compactions, zero crashes) — confirming the
+hybrid eager/graph decode path is correct. The **3.5× throughput cost here is the
+worst case**: GSM8K has short outputs and no memory pressure, so R-KV is pure
+overhead with no memory payoff to recoup. R-KV wins on throughput only when the
+server is memory-bound with long decodes. Full analysis (and the earlier
+eager-path numbers): [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md).
 
 ---
 
@@ -78,8 +82,7 @@ python3 -m sglang.launch_server \
   --attention-backend flashinfer \
   --enable-rkv \
   --rkv-config '{"budget": 512, "window_size": 8, "buffer_size": 16, "mix_lambda": 0.1}' \
-  --disable-radix-cache --disable-decode-cuda-graph --disable-prefill-cuda-graph \
-  --disable-overlap-schedule --page-size 1
+  --disable-radix-cache --disable-overlap-schedule --page-size 1
 ```
 
 ## Parameters
@@ -107,12 +110,17 @@ frees KV slots mid-generation:
 
 - `--disable-radix-cache` — R-KV frees KV slots the prefix cache would still
   reference.
-- `--disable-decode-cuda-graph` (or `--disable-cuda-graph`) — dynamic eviction
-  cannot run inside a captured CUDA graph, so decode runs eager.
 - `--disable-overlap-schedule`, `--page-size 1` — phase-1 simplifications.
 - `--tp-size 1` — tensor parallelism is not yet supported (plain data
   parallelism `--dp-size N --tp-size 1` **is** supported; see
   [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)).
 
-A **fair** speed comparison uses the `baseline` mode (eager, same flags, no
-`--enable-rkv`), not `baseline-cudagraph`.
+**Decode CUDA graph is supported** (and recommended): a per-step hook forces the
+`window_size` steps ending at each compaction — plus the compaction step — to run
+eager, while every other decode step replays the captured graph. Logical rotary
+positions are restored at `ForwardBatch` construction so graph-replay steps stay
+correct. (Prefill CUDA graph is fine too; R-KV only acts during decode.)
+
+A **fair** speed comparison uses the `baseline` mode (same flags, CUDA graph on,
+no `--enable-rkv`); `baseline-production` additionally re-enables the radix cache
+for a full-production reference.

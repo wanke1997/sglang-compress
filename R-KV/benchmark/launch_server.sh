@@ -2,9 +2,9 @@
 # Launch an SGLang server for the R-KV benchmark.
 #
 # Usage:
-#   ./launch_server.sh baseline               # R-KV OFF, eager config (fair compare)
+#   ./launch_server.sh baseline               # R-KV OFF, same flags as R-KV (fair compare; CUDA graph ON)
 #   ./launch_server.sh rkv 512                 # R-KV ON,  budget=512 (256/512/1024 ...)
-#   ./launch_server.sh baseline-cudagraph      # R-KV OFF, CUDA graph on (production-like)
+#   ./launch_server.sh baseline-production     # R-KV OFF, full production (radix cache + CUDA graph ON)
 #
 # Data parallel (optional): set DP=N to run N R-KV replicas (plain DP, tp=1).
 # Each replica keeps its own KV pool and runs R-KV independently; a router
@@ -27,11 +27,14 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 export PYTHONPATH="$REPO/python"
 export HF_HUB_DISABLE_XET=1  # HF Xet transfer can hang on large files
 
-# R-KV requires: eager decode (no captured CUDA graph), radix/prefix cache OFF
-# (R-KV frees slots the radix tree still references -> pool double-count crash),
-# overlap OFF (simple timing), page_size=1 (clean per-slot free).
-RKV_FLAGS=(--disable-decode-cuda-graph --disable-prefill-cuda-graph
-           --disable-overlap-schedule --disable-radix-cache --page-size 1)
+# R-KV requires: radix/prefix cache OFF (R-KV frees slots the radix tree still
+# references -> pool double-count crash), overlap OFF (phase-1 simplification),
+# page_size=1 (clean per-slot free). Decode CUDA graph IS supported and left ON:
+# a per-step hook forces the `window_size` steps ending at each compaction (plus
+# the compaction step) to run eager, while every other decode step replays the
+# captured graph (logical rotary positions are restored at ForwardBatch
+# construction so graph-replay steps see them too).
+RKV_FLAGS=(--disable-overlap-schedule --disable-radix-cache --page-size 1)
 
 COMMON=(--model-path "$MODEL" --attention-backend flashinfer
         --mem-fraction-static "$MEM_FRAC" --host 127.0.0.1 --port "$PORT")
@@ -52,15 +55,15 @@ case "$MODE" in
       --rkv-config "{\"budget\":$BUDGET,\"window_size\":$WINDOW,\"buffer_size\":$BUFFER}"
     ;;
   baseline)
-    echo ">> BASELINE (eager, same flags as R-KV, no --enable-rkv) dp=$DP"
+    echo ">> BASELINE (same flags as R-KV, CUDA graph ON, no --enable-rkv) dp=$DP"
     exec python3 -m sglang.launch_server "${COMMON[@]}" "${RKV_FLAGS[@]}" "${DP_FLAGS[@]}"
     ;;
-  baseline-cudagraph)
-    echo ">> BASELINE (production-like: CUDA graph on)"
-    exec python3 -m sglang.launch_server "${COMMON[@]}" --disable-prefill-cuda-graph
+  baseline-production)
+    echo ">> BASELINE (full production: radix cache + CUDA graph ON)"
+    exec python3 -m sglang.launch_server "${COMMON[@]}"
     ;;
   *)
-    echo "unknown mode: $MODE (use: baseline | rkv <budget> | baseline-cudagraph)" >&2
+    echo "unknown mode: $MODE (use: baseline | rkv <budget> | baseline-production)" >&2
     exit 1
     ;;
 esac

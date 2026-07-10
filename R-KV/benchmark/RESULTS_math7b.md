@@ -4,6 +4,61 @@ Dedicated report for the R-KV port on a **strong math model**, where accuracy
 differences are signal rather than noise. Companion to [`RESULTS.md`](./RESULTS.md)
 (which also covers the weak Qwen2.5-0.5B sanity check).
 
+Two campaigns:
+- **§A — GSM8K with decode CUDA graph ON (2026-07-10, current).** n=200, the
+  standard [`benchmark/gsm8k/bench_sglang.py`](../../benchmark/gsm8k/bench_sglang.py)
+  harness, decode CUDA graph enabled — the production-relevant run.
+- **§B — phase-1 eager-path sweep (historical).** The original n=20 correctness
+  sweep on the eager decode path (predates CUDA-graph support), kept for
+  reference.
+
+---
+
+## A. GSM8K with decode CUDA graph ON (current)
+
+**Setup.** `Qwen2.5-Math-7B-Instruct`, single H100 (`--mem-fraction-static 0.85`),
+GSM8K test set, **200 questions**, 5-shot, `max_new_tokens=512`, `temperature=0`,
+`--parallel 32`. R-KV `budget=512, window=8, buffer=16`. **Decode CUDA graph ON
+for both** (R-KV uses the hybrid eager/graph path); the baseline is the same
+flags without `--enable-rkv` (`--disable-radix-cache --disable-overlap-schedule
+--page-size 1`).
+
+| Config | Accuracy (200) | Total time | Throughput | Compactions |
+| --- | ---: | ---: | ---: | ---: |
+| Full-KV baseline | 90.0% | 12.1 s | 1817 tok/s | — |
+| **R-KV decode** | **91.5%** | 43.0 s | 510 tok/s | 1263 |
+
+**Findings.**
+
+1. **Accuracy is lossless** — R-KV 91.5% vs full-KV 90.0% (within n=200 judge
+   noise; R-KV nominally higher), even though `budget=512 < prompt (~900)` so R-KV
+   evicts part of the few-shot prompt itself.
+2. **Decode CUDA graph works with R-KV.** 1263 physical compactions, zero
+   crashes; startup captured both the prefill and decode graphs and the run
+   logged `cuda graph: True`. The hybrid path — the `window_size` steps ending at
+   each compaction plus the compaction step run eager, every other decode step
+   replays the graph — is correct. **This supersedes the old "R-KV must run
+   eager" constraint.**
+3. **But throughput costs 3.5× here — the worst case.** GSM8K has **short outputs
+   (~110 tok/req)** and **no memory pressure** (sequences fit easily), so R-KV is
+   *pure overhead*: it pays the per-`buffer_size` compaction (O(budget²)
+   key-similarity + slot relocation) and, with `buffer_size=16` / `window_size=8`,
+   forces ~9 of every 16 decode steps eager — losing the graph on the majority of
+   steps. In the CUDA-graph regime the **baseline speeds up far more than R-KV**
+   (full ~101→1817 tok/s vs R-KV ~74→510 across the eager→graph move), so the
+   *relative* gap widens beyond the old eager-vs-eager ~28%.
+4. **Two knobs shrink it:** a larger `buffer_size` (rarer compactions → fewer
+   forced-eager steps) and cross-layer score subsampling (the O(budget²) scoring
+   dominates). And the *benefit* side (memory-bound, long CoT) is not exercised
+   here at all — see the §B caveat.
+
+---
+
+## B. Phase-1 eager-path sweep (historical, n=20)
+
+> These numbers predate decode-CUDA-graph support; R-KV and the baseline both ran
+> **eager** here. Kept for the correctness sweep and the eager-vs-eager overhead.
+
 ## Setup
 
 - **Model**: `Qwen/Qwen2.5-Math-7B-Instruct` (dense, GQA, rotary; `bf16`).
@@ -78,18 +133,31 @@ still needed to show the upside.
 
 ## Reproduce
 
+**§A — GSM8K with CUDA graph (current):**
+
+```bash
+# R-KV decode (CUDA graph ON):
+MODEL=/data/model/Qwen2.5-Math-7B-Instruct MEM_FRAC=0.85 PORT=30030 \
+  bash R-KV/benchmark/launch_server.sh rkv 512
+PYTHONPATH=$PWD/python python3 benchmark/gsm8k/bench_sglang.py \
+  --num-questions 200 --num-shots 5 --parallel 32 --host http://127.0.0.1 --port 30030
+
+# Full-KV baseline (same flags, CUDA graph ON):
+MODEL=/data/model/Qwen2.5-Math-7B-Instruct MEM_FRAC=0.85 PORT=30030 \
+  bash R-KV/benchmark/launch_server.sh baseline
+PYTHONPATH=$PWD/python python3 benchmark/gsm8k/bench_sglang.py \
+  --num-questions 200 --num-shots 5 --parallel 32 --host http://127.0.0.1 --port 30030
+```
+
+**§B — phase-1 eager sweep (historical):**
+
 ```bash
 cd R-KV/benchmark
 ./prepare_data.sh   # or use an existing test.jsonl via --data
 
-# baseline (eager)
 MODEL=/data/model/Qwen2.5-Math-7B-Instruct MEM_FRAC=0.85 ./launch_server.sh baseline
 python3 eval.py --n 20 --label base7b
 
-# R-KV budget=512
 MODEL=/data/model/Qwen2.5-Math-7B-Instruct MEM_FRAC=0.85 ./launch_server.sh rkv 512
 python3 eval.py --n 20 --label rkv7b_b512
-
-# R-KV budget=512, batched (concurrency=8)
-python3 eval.py --n 20 --concurrency 8 --label rkv7b_b512_c8
 ```

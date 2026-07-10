@@ -71,11 +71,13 @@ large enough. Crucially, the server ran **hundreds of physical compactions
 computes an O(budget²) key-similarity, and relocates slots — all synchronous on
 the eager path.
 
-**Loss of CUDA graph** (implicit, larger): R-KV must run eager, while a
-production baseline uses CUDA graph. So versus a *production* baseline, most of
-the end-to-end slowdown comes from losing CUDA graph, not from the compaction
-itself — see the Math-7B `concurrency=8` result (272 tok/s) for how batching
-amortizes the eager overhead.
+**Loss of CUDA graph (historical — no longer required).** These 0.5B numbers are
+the earlier **eager-vs-eager** measurement, when R-KV ran eager. **Decode CUDA
+graph is now supported** via the hybrid eager/graph path, so R-KV no longer gives
+up the graph wholesale. It does still cost throughput on short, non-memory-bound
+workloads because the baseline gains *more* from the graph than R-KV does (the
+window + compaction steps still run eager) — see the current CUDA-graph GSM8K
+result in [`RESULTS_math7b.md`](./RESULTS_math7b.md) §A.
 
 ## Caveat: this scenario is cost-only for R-KV
 

@@ -35,9 +35,9 @@ cd R-KV/benchmark
 ./prepare_data.sh
 
 # 2a. Terminal A — start a server (pick one):
-./launch_server.sh baseline            # R-KV OFF, eager config (fair compare)
-./launch_server.sh rkv 512             # R-KV ON,  budget=512
-./launch_server.sh baseline-cudagraph  # R-KV OFF, CUDA graph on (production-like)
+./launch_server.sh baseline             # R-KV OFF, same flags (fair compare; CUDA graph ON)
+./launch_server.sh rkv 512              # R-KV ON,  budget=512
+./launch_server.sh baseline-production  # R-KV OFF, full production (radix cache + CUDA graph ON)
 
 # 2b. Terminal B — run the eval (after the server prints "Uvicorn running"):
 python3 eval.py --n 100 --label rkv_b512
@@ -60,13 +60,16 @@ R-KV **requires** a specific server configuration, and the benchmark encodes it:
   would still reference; leaving radix on double-counts the pool and crashes the
   server's leak checker at idle. R-KV and prefix caching are fundamentally
   incompatible (prefix reuse assumes KV is immutable; R-KV evicts it).
-- **`--disable-decode-cuda-graph`** — dynamic eviction cannot live inside a
-  captured CUDA graph, so R-KV runs on the eager decode path.
 - **`--disable-overlap-schedule`, `--page-size 1`** — phase-1 simplifications
   (simple timing; per-slot free is clean at page_size=1).
 
-Because R-KV must run eager, a **fair** speed comparison uses the `baseline`
-(eager, same flags, no `--enable-rkv`) mode, not `baseline-cudagraph`.
+**Decode CUDA graph is supported** (hybrid path, and left ON): the `window_size`
+steps ending at each compaction — plus the compaction step — run eager, while
+every other decode step replays the captured graph (logical rotary positions are
+restored at `ForwardBatch` construction so graph-replay steps stay correct). So a
+**fair** speed comparison uses the `baseline` mode (same flags, CUDA graph on, no
+`--enable-rkv`); `baseline-production` additionally re-enables the radix cache for
+a full-production reference.
 
 ## Judging
 
