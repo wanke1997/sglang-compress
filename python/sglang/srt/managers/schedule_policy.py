@@ -451,7 +451,7 @@ class PrefillAdder:
         # _get_running_request_total_token_offset (called below on the running
         # batch) reads it.
         self.rkv_compressor = rkv_compressor
-        # Prompt-phase compressor (SnapKV or R-KV-prefill), or None. These free
+        # Prompt-phase compressor (R-KV-prefill), or None. It frees
         # the prompt down to `budget` at the END of prefill, so a request's
         # steady-state decode footprint is min(prompt, budget) + output. New-
         # request admission reserves that smaller lifetime footprint (while the

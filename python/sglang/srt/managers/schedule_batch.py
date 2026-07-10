@@ -708,7 +708,6 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
-        task_type: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -783,9 +782,6 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
-        # Task-type hint (e.g. "summarization") used to selectively enable
-        # SnapKV prompt compression for this request.
-        self.task_type = task_type
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None

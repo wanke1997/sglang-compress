@@ -238,11 +238,6 @@ class GenerateReqInput(BaseReq):
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
-    # Task-type hint (e.g. "summarization"), typically populated from the
-    # `task_type` HTTP header. Used to selectively enable prompt-phase KV
-    # compression (SnapKV) per request; unset / other value => full KV.
-    task_type: Optional[str] = None
-
     # Priority for the request
     priority: Optional[int] = None
 
@@ -821,11 +816,6 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
-
-    # Task-type hint (e.g. "summarization") forwarded from GenerateReqInput.
-    # Crosses the tokenizer->scheduler process boundary so the scheduler can
-    # selectively enable SnapKV prompt compression per request.
-    task_type: Optional[str] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None

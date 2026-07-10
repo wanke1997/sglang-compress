@@ -98,13 +98,6 @@ class SchedulerBatchResultProcessor:
                 )
                 if _rkv is not None:
                     _rkv.on_request_end(req)
-                _snapkv = getattr(
-                    getattr(self.model_worker, "model_runner", None),
-                    "snapkv_compressor",
-                    None,
-                )
-                if _snapkv is not None:
-                    _snapkv.on_request_end(req)
                 _rkv_prefill = getattr(
                     getattr(self.model_worker, "model_runner", None),
                     "rkv_prefill_compressor",
@@ -883,13 +876,6 @@ class SchedulerBatchResultProcessor:
                 )
                 if _rkv is not None:
                     _rkv.on_request_end(req)
-                _snapkv = getattr(
-                    getattr(self.model_worker, "model_runner", None),
-                    "snapkv_compressor",
-                    None,
-                )
-                if _snapkv is not None:
-                    _snapkv.on_request_end(req)
                 _rkv_prefill = getattr(
                     getattr(self.model_worker, "model_runner", None),
                     "rkv_prefill_compressor",

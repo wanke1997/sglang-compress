@@ -30,7 +30,7 @@ than reworking a previous (buggy, slow) integration.
 | --- | --- |
 | `dev-v0.5.14` | Active development. Clean SGLang v0.5.14 baseline + this port. |
 | `release/sglang-v0.5.14` | Pristine v0.5.14 reference. **Do not modify.** |
-| `dev` / `main` | Old CustomKV/SnapKV implementation on SGLang v0.4.3 (buggy + slow). Kept only for reference. |
+| `dev` / `main` | Old CustomKV implementation on SGLang v0.4.3 (buggy + slow). Kept only for reference. |
 
 `upstream` remote points to official `sgl-project/sglang` for future syncs.
 

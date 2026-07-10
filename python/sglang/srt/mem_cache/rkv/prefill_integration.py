@@ -1,20 +1,18 @@
 """R-KV as a prefill-phase compressor — SGLang serving integration.
 
 Bridges the pure prefill algorithm (:mod:`sglang.srt.mem_cache.rkv.prefill`,
-:class:`RKVPrefill`) to SGLang's paged KV cache, mirroring
-:class:`sglang.srt.mem_cache.snapkv.integration.SnapKVCompressor` method-for-method
-so it drops into the exact same wiring points (``observe_prefill_layer`` from
-``forward_extend``, ``maybe_compact`` after an extend forward,
-``override_decode_positions`` at decode, ``on_request_begin/end`` from the
-scheduler). The only difference from SnapKV is the *score*: R-KV combines
+:class:`RKVPrefill`) to SGLang's paged KV cache. It wires into the prompt-phase
+compression hooks (``observe_prefill_layer`` from ``forward_extend``,
+``maybe_compact`` after an extend forward, ``override_decode_positions`` at
+decode, ``on_request_begin/end`` from the scheduler). The score combines
 attention importance with a key-redundancy term (``O(n^2)`` similarity computed
 in row blocks so peak memory stays ``O(n)``).
 
 Two modes, selected by :attr:`RKVPrefillConfig.mode`:
 
 * ``"oneshot"`` (route A) — score the whole prompt once, at the end of prefill,
-  against the true final observation window. Structurally identical to SnapKV
-  (compresses once, before decode); this is the accuracy oracle.
+  against the true final observation window (compresses once, before decode);
+  this is the accuracy oracle.
 * ``"buffered"`` (route B) — compress mid-prefill whenever the physical KV length
   exceeds ``budget + buffer``, bounding the similarity matrix. Trades a little
   fidelity (premature eviction) for prompt-length-independent memory. The
@@ -47,8 +45,8 @@ logger = logging.getLogger(__name__)
 class RKVPrefillConfig(msgspec.Struct):
     """Hyper-parameters for R-KV prefill compression.
 
-    Defaults mirror the R-KV reference (``window_size`` bumped to a SnapKV-like
-    32 for prompt-phase scoring). ``mode`` picks the one-shot oracle or the
+    Defaults mirror the R-KV reference (``window_size`` bumped to 32 for
+    prompt-phase scoring). ``mode`` picks the one-shot oracle or the
     buffered strategy; ``buffer`` only matters for ``"buffered"``.
     """
 
@@ -75,7 +73,7 @@ class RKVPrefillConfig(msgspec.Struct):
 class RKVPrefillRequestState:
     """Per-request bookkeeping, keyed by ``req_pool_idx``.
 
-    For ``oneshot`` this is SnapKV-shaped: a cross-layer score accumulator plus a
+    For ``oneshot`` it holds a cross-layer score accumulator plus a
     per-layer buffer of the true final observation-window queries (filled across
     chunks). For ``buffered`` the per-layer buffer instead holds the *sliding*
     last-``window_size`` queries and ``compressed`` is never latched (a request
@@ -107,7 +105,7 @@ class RKVPrefillRequestState:
 
 
 class RKVPrefillCompressor:
-    """R-KV prefill compressor with SnapKV-compatible wiring hooks."""
+    """R-KV prefill compressor wired into the prompt-phase compression hooks."""
 
     def __init__(
         self,
@@ -152,9 +150,8 @@ class RKVPrefillCompressor:
     # ------------------------------------------------------------------
     @staticmethod
     def request_wants_compression(req: Req) -> bool:
-        """Gate on the ``task_type`` header, same policy as SnapKV."""
-        task_type = getattr(req, "task_type", None)
-        return (task_type or "").strip().lower() == "summarization"
+        """R-KV prefill compresses every request when enabled (unconditional)."""
+        return True
 
     def on_request_begin(self, req: Req) -> None:
         if req.req_pool_idx is None:

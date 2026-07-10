@@ -308,9 +308,6 @@ class FlashInferAttnBackend(AttentionBackend):
         # R-KV compressor (constructed in alloc_memory_pool, which runs before
         # attention backends are built). None when R-KV is disabled.
         self.rkv_compressor = getattr(model_runner, "rkv_compressor", None)
-        # SnapKV prompt-phase compressor (same construction timing). None when
-        # SnapKV is disabled.
-        self.snapkv_compressor = getattr(model_runner, "snapkv_compressor", None)
         # R-KV prefill (prompt-phase) compressor (same construction timing).
         self.rkv_prefill_compressor = getattr(
             model_runner, "rkv_prefill_compressor", None
@@ -776,13 +773,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 # after R-KV eviction.
                 forward_batch.rkv_compressor = self.rkv_compressor
                 self.rkv_compressor.override_decode_positions(forward_batch)
-            if self.snapkv_compressor is not None:
-                # After prompt compaction seq_lens tracks the physical (shrunk)
-                # KV length; restore logical rotary positions for decode.
-                forward_batch.snapkv_compressor = self.snapkv_compressor
-                self.snapkv_compressor.override_decode_positions(forward_batch)
             if self.rkv_prefill_compressor is not None:
-                # Same as SnapKV: seq_lens tracks the shrunk physical KV length
+                # Same rationale: seq_lens tracks the shrunk physical KV length
                 # after prompt compaction; restore logical rotary positions.
                 forward_batch.rkv_prefill_compressor = self.rkv_prefill_compressor
                 self.rkv_prefill_compressor.override_decode_positions(forward_batch)
@@ -1107,23 +1099,10 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer.v_scale,
                 )
 
-        snapkv_compressor = self.snapkv_compressor
-        if snapkv_compressor is not None:
-            # The prompt K/V for this layer is now in the pool (set_kv_buffer ran
-            # in whichever branch above). Observe the observation-window queries
-            # and accumulate this layer's SnapKV importance score per request.
-            snapkv_compressor.observe_prefill_layer(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k,
-                v,
-                layer,
-                forward_batch,
-            )
-
         rkv_prefill_compressor = self.rkv_prefill_compressor
         if rkv_prefill_compressor is not None:
-            # Same hook as SnapKV: buffer this layer's observation-window queries
-            # (R-KV scores importance+redundancy at compaction time).
+            # Buffer this layer's observation-window queries (R-KV scores
+            # importance+redundancy at compaction time).
             rkv_prefill_compressor.observe_prefill_layer(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k,

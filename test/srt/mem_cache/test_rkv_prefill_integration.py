@@ -115,15 +115,12 @@ class MockAllocator:
 
 
 class _MockReq:
-    def __init__(
-        self, origin_len, output_len=0, req_pool_idx=1, task_type="summarization"
-    ):
+    def __init__(self, origin_len, output_len=0, req_pool_idx=1):
         self.origin_input_ids = list(range(origin_len))
         self.output_ids = list(range(output_len))
         self.kv_committed_len = origin_len + output_len
         self.kv_allocated_len = origin_len + output_len
         self.req_pool_idx = req_pool_idx
-        self.task_type = task_type
 
     @property
     def seqlen(self):
@@ -187,13 +184,12 @@ class TestConfig(unittest.TestCase):
             RKVPrefillConfig(budget=8, window_size=8)
 
 
-class TestTaskTypeGate(unittest.TestCase):
-    def test_gate(self):
+class TestUnconditionalCompression(unittest.TestCase):
+    def test_always_wants_compression(self):
+        # R-KV prefill is unconditional: every request is compressed when enabled.
         f = RKVPrefillCompressor.request_wants_compression
-        self.assertTrue(f(_MockReq(10, task_type="summarization")))
-        self.assertTrue(f(_MockReq(10, task_type="  Summarization ")))
-        self.assertFalse(f(_MockReq(10, task_type="classification")))
-        self.assertFalse(f(_MockReq(10, task_type="")))
+        self.assertTrue(f(_MockReq(10)))
+        self.assertTrue(f(_MockReq(500, output_len=20)))
 
 
 class TestAssembleKept(unittest.TestCase):

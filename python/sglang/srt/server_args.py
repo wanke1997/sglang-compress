@@ -1888,36 +1888,6 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
-    # SnapKV (prompt-phase / prefill-time KV cache compression)
-    # -------------------------------------------------------------------------
-    enable_snapkv: A[bool, "Enable SnapKV prompt-phase KV cache compression"] = False
-    # Per-field SnapKV hyper-parameters. Defaults mirror SnapKVConfig. Any field
-    # is overridable by --snapkv-config JSON (which takes priority).
-    snapkv_max_capacity_prompt: A[
-        int, "SnapKV: prompt KV entries kept per request after compression."
-    ] = 1024
-    snapkv_window_size: A[
-        int, "SnapKV: trailing observation window whose queries score the prompt."
-    ] = 32
-    snapkv_kernel_size: A[
-        int, "SnapKV: 1-D pooling kernel size for attention clustering."
-    ] = 5
-    snapkv_pooling: A[
-        str,
-        Arg(
-            help="SnapKV: pooling used to cluster attention mass.",
-            choices=["avgpool", "maxpool"],
-        ),
-    ] = "avgpool"
-    snapkv_config: A[
-        Optional[str],
-        Arg(
-            help='A dictionary in JSON string format that OVERRIDES the per-field SnapKV flags above. Example: \'{"max_capacity_prompt": 1024, "window_size": 32, "kernel_size": 5, "pooling": "avgpool"}\'',
-            aliases=["--snapkv-extra-config"],
-        ),
-    ] = None
-
-    # -------------------------------------------------------------------------
     # R-KV prefill (prompt-phase KV compression using R-KV importance+redundancy)
     # -------------------------------------------------------------------------
     enable_rkv_prefill: A[
@@ -2591,8 +2561,6 @@ class ServerArgs:
 
         self._handle_rkv_validation()
 
-        self._handle_snapkv_validation()
-
         self._handle_rkv_prefill_validation()
 
         # Handle device-specific backends.
@@ -3039,8 +3007,8 @@ class ServerArgs:
     def _handle_rkv_prefill_validation(self):
         """Enforce the invariants R-KV prefill compression depends on.
 
-        R-KV prefill physically frees prompt KV slots right after prefill (like
-        SnapKV), so it needs prefix caching off, the prefill CUDA graph off
+        R-KV prefill physically frees prompt KV slots right after prefill, so
+        it needs prefix caching off, the prefill CUDA graph off
         (prompt-phase scoring/compaction are dynamic), overlap scheduling off,
         page_size 1, and TP == 1.
         Overlap scheduling is NOT supported: the prefill-end compaction frees KV
@@ -3052,17 +3020,16 @@ class ServerArgs:
         positions are already overlap-correct; the allocator free is the blocker.)
         Decode CUDA graph IS supported (logical positions restored
         at ForwardBatch construction). It is mutually exclusive with the decode
-        R-KV compressor and with SnapKV (all own physical-length / rotary
+        R-KV compressor (both own physical-length / rotary
         bookkeeping). ``mode='buffered'`` (route B) does its segmented eviction
         logically during prefill and one physical compaction at the end, so it
         supports chunked prefill just like ``oneshot``.
         """
         if not self.enable_rkv_prefill:
             return
-        if self.enable_rkv or self.enable_snapkv:
+        if self.enable_rkv:
             raise ValueError(
-                "--enable-rkv-prefill cannot be combined with --enable-rkv or "
-                "--enable-snapkv."
+                "--enable-rkv-prefill cannot be combined with --enable-rkv."
             )
         if not self.disable_radix_cache:
             raise ValueError(
@@ -3091,57 +3058,6 @@ class ServerArgs:
             raise ValueError(
                 "--enable-rkv-prefill does not support tensor parallelism yet."
             )
-
-    def _handle_snapkv_validation(self):
-        """Enforce the invariants SnapKV's memory safety depends on.
-
-        See SnapKV/doc/DESIGN.md: SnapKV physically frees prompt KV slots right
-        after prefill, which is incompatible with prefix caching (the radix tree
-        would keep references into freed slots), captured prefill CUDA graphs
-        (the prompt-phase scoring and one-time compaction are dynamic), page_size
-        > 1 (per-slot free), and TP > 1 (per-rank eviction would diverge).
-        Overlap scheduling is NOT supported: the one-time prompt compaction frees
-        KV slots from inside the forward (forward stream), which races with the
-        overlap scheduler's async next-batch allocation on the same free-list
-        tensor (default stream), causing an illegal memory access at scale (the
-        same reason the decode R-KV compressor requires overlap off). Decode CUDA
-        graph and chunked prefill ARE supported: the only decode-time dynamic
-        (logical rotary positions) is applied at ForwardBatch construction,
-        consumed by both the eager and CUDA-graph-replay paths; the
-        observation-window queries are buffered across prefill chunks and scored
-        on the final chunk. Cannot run alongside R-KV (both own the
-        physical-length / rotary bookkeeping).
-        """
-        if not self.enable_snapkv:
-            return
-        if getattr(self, "enable_rkv", False):
-            raise ValueError(
-                "--enable-snapkv and --enable-rkv cannot be used together."
-            )
-        if not self.disable_radix_cache:
-            raise ValueError(
-                "--enable-snapkv requires --disable-radix-cache: SnapKV frees KV "
-                "slots that the radix/prefix cache would still reference."
-            )
-        if not (self.disable_prefill_cuda_graph or self.disable_cuda_graph):
-            raise ValueError(
-                "--enable-snapkv requires --disable-prefill-cuda-graph: the "
-                "prompt-phase observation and one-time compaction are dynamic "
-                "and cannot run inside a captured prefill CUDA graph. (Decode "
-                "CUDA graph is supported and may stay enabled.)"
-            )
-        if not self.disable_overlap_schedule:
-            raise ValueError(
-                "--enable-snapkv requires --disable-overlap-schedule: the "
-                "one-time prompt compaction frees KV slots from inside the "
-                "forward (forward stream), which races with the overlap "
-                "scheduler's async next-batch allocation on the free-list "
-                "(default stream) and causes an illegal memory access at scale."
-            )
-        if self.page_size not in (None, 1):
-            raise ValueError("--enable-snapkv requires --page-size 1 (per-slot free).")
-        if self.tp_size > 1:
-            raise ValueError("--enable-snapkv does not support tensor parallelism yet.")
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase

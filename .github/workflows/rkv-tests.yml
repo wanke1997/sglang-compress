@@ -1,6 +1,6 @@
-name: RKV/SnapKV Tests
+name: RKV Tests
 
-# Lightweight, GPU-free CI for the R-KV / SnapKV KV-cache compression port.
+# Lightweight, GPU-free CI for the R-KV KV-cache compression port.
 # The upstream SGLang hardware CI (AMD/NPU/XPU/GPU, gated by the `run-ci`
 # label + self-hosted runner fleet) cannot run on this fork, so it was
 # removed. These unit tests exercise the pure algorithm and integration
@@ -12,14 +12,12 @@ on:
   pull_request:
     paths:
       - "python/sglang/srt/mem_cache/rkv/**"
-      - "python/sglang/srt/mem_cache/snapkv/**"
       - "test/srt/mem_cache/test_rkv_*.py"
-      - "test/srt/mem_cache/test_snapkv_*.py"
-      - ".github/workflows/rkv-snapkv-tests.yml"
+      - ".github/workflows/rkv-tests.yml"
   workflow_dispatch:
 
 concurrency:
-  group: rkv-snapkv-tests-${{ github.ref }}
+  group: rkv-tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -38,6 +36,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Run RKV/SnapKV unit tests
+      - name: Run RKV unit tests
         run: |
           python -m unittest discover -s test/srt/mem_cache -p 'test_*.py' -v

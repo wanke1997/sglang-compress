@@ -11,9 +11,9 @@ SGLang's paged KV pool. It ships in **two modes**:
   **long reasoning**: short prompt, long output.
 - **Prefill-time** (`--enable-rkv-prefill`) — compress the **prompt** once at the
   end of prefill (`oneshot`) or in bounded chunks during prefill (`buffered`),
-  then decode against the smaller cache. Same shape as SnapKV, but with R-KV's
-  importance+redundancy scoring. Best for **long context**: long prompt, short
-  output (e.g. summarisation).
+  then decode against the smaller cache, using R-KV's importance+redundancy
+  scoring. Best for **long context**: long prompt, short output (e.g.
+  summarisation).
 
 This directory's docs and benchmark below focus on the **decode-time** mode; the
 **prefill-time** mode's design, results and roadmap live in
@@ -65,22 +65,20 @@ eager-path numbers): [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md
 
 ---
 
-## R-KV modes vs SnapKV
+## R-KV modes: decode vs prefill
 
-All three keep a fixed KV budget per request and physically free the rest; they
+Both keep a fixed KV budget per request and physically free the rest; they
 differ in **when** they fire and **what** they compress:
 
-| | **R-KV decode** (`--enable-rkv`) | **R-KV prefill** (`--enable-rkv-prefill`) | **SnapKV** ([`../SnapKV`](../SnapKV/)) |
-| --- | --- | --- | --- |
-| When | repeatedly, during decode | once at prefill end (or chunked) | once, at prefill end |
-| Target | the generated **output** (CoT) | the **prompt** | the **prompt** |
-| Score | importance − redundancy | importance − redundancy | window attention + pooling |
-| Best for | long reasoning (short in, long out) | long context (long in, short out) | long context (long in, short out) |
+| | **R-KV decode** (`--enable-rkv`) | **R-KV prefill** (`--enable-rkv-prefill`) |
+| --- | --- | --- |
+| When | repeatedly, during decode | once at prefill end (or chunked) |
+| Target | the generated **output** (CoT) | the **prompt** |
+| Score | importance − redundancy | importance − redundancy |
+| Best for | long reasoning (short in, long out) | long context (long in, short out) |
 
-**R-KV prefill** and **SnapKV** occupy the same niche (compress a long prompt);
-R-KV prefill adds the redundancy term at an extra O(n²) scoring cost. See
-[`doc/FINDINGS_AND_ROADMAP.md`](doc/FINDINGS_AND_ROADMAP.md) for the head-to-head
-and the summarisation results.
+See [`doc/FINDINGS_AND_ROADMAP.md`](doc/FINDINGS_AND_ROADMAP.md) for the
+prefill-mode design, results and roadmap.
 
 ## Usage
 

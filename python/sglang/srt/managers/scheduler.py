@@ -354,8 +354,6 @@ class Scheduler(
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
         self.enable_rkv = server_args.enable_rkv
         self.rkv_compressor = None
-        self.enable_snapkv = server_args.enable_snapkv
-        self.snapkv_compressor = None
         self.enable_rkv_prefill = server_args.enable_rkv_prefill
         self.rkv_prefill_compressor = None
 
@@ -486,10 +484,6 @@ class Scheduler(
         if self.enable_rkv:
             # RKVCompressor was created inside ModelRunner.alloc_memory_pool().
             self.rkv_compressor = self.tp_worker.model_runner.rkv_compressor
-
-        if self.enable_snapkv:
-            # SnapKVCompressor was created inside ModelRunner.alloc_memory_pool().
-            self.snapkv_compressor = self.tp_worker.model_runner.snapkv_compressor
 
         if self.enable_rkv_prefill:
             # RKVPrefillCompressor was created inside ModelRunner.alloc_memory_pool().
@@ -868,8 +862,6 @@ class Scheduler(
         # it now that the pools (and the compressor) actually exist.
         if self.enable_rkv:
             self.rkv_compressor = self.tp_worker.model_runner.rkv_compressor
-        if self.enable_snapkv:
-            self.snapkv_compressor = self.tp_worker.model_runner.snapkv_compressor
         if self.enable_rkv_prefill:
             self.rkv_prefill_compressor = (
                 self.tp_worker.model_runner.rkv_prefill_compressor
@@ -2085,7 +2077,6 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
-                task_type=recv_req.task_type,
             )
             req.tokenizer = self.tokenizer
 
@@ -2824,12 +2815,10 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             rkv_compressor=self.rkv_compressor,
-            # SnapKV / R-KV-prefill are mutually exclusive and both compress the
-            # prompt at prefill end, so admission reserves their smaller
-            # steady-state footprint (min(prompt, budget) + max_new).
-            prompt_phase_compressor=(
-                self.snapkv_compressor or self.rkv_prefill_compressor
-            ),
+            # R-KV-prefill compresses the prompt at prefill end, so admission
+            # reserves its smaller steady-state footprint
+            # (min(prompt, budget) + max_new).
+            prompt_phase_compressor=self.rkv_prefill_compressor,
         )
 
         if self.chunked_req is not None:
@@ -2967,18 +2956,9 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        # SnapKV: register newly-prefilled requests now that prepare_for_extend
-        # has assigned their req_pool_idx, so the prefill forward's observation
-        # hook can find their per-request state.
-        if self.snapkv_compressor is not None:
-            for req in new_batch.reqs:
-                if not self.snapkv_compressor.request_wants_compression(req):
-                    continue
-                st = self.snapkv_compressor.states.get(req.req_pool_idx)
-                if st is None or st.req is not req:
-                    self.snapkv_compressor.on_request_begin(req)
-
-        # R-KV prefill: same registration as SnapKV.
+        # R-KV prefill: register newly-prefilled requests now that
+        # prepare_for_extend has assigned their req_pool_idx, so the prefill
+        # forward's observation hook can find their per-request state.
         if self.rkv_prefill_compressor is not None:
             for req in new_batch.reqs:
                 if not self.rkv_prefill_compressor.request_wants_compression(req):
@@ -3053,12 +3033,11 @@ class Scheduler(
 
     def _retract_compressors(self) -> tuple:
         """Active KV compressors whose per-request state must be dropped on
-        retraction (decode R-KV + prompt-phase SnapKV / R-KV-prefill)."""
+        retraction (decode R-KV + prompt-phase R-KV-prefill)."""
         return tuple(
             c
             for c in (
                 self.rkv_compressor,
-                self.snapkv_compressor,
                 self.rkv_prefill_compressor,
             )
             if c is not None
@@ -3158,35 +3137,15 @@ class Scheduler(
         if self.rkv_compressor is not None:
             self._apply_rkv_pre_decode(batch)
 
-        # SnapKV: apply the prompt-compaction physical KV length shrink to
+        # R-KV prefill: apply the prompt-compaction physical KV length shrink to
         # seq_lens before prepare_for_decode advances it (rotary stays logical
-        # via SnapKVCompressor.override_decode_positions at forward time).
-        if self.snapkv_compressor is not None:
-            self._apply_snapkv_pre_decode(batch)
-
-        # R-KV prefill: same as SnapKV — drain the pending physical-length shrink.
+        # via override_decode_positions at forward time).
         if self.rkv_prefill_compressor is not None:
             self._apply_rkv_prefill_pre_decode(batch)
 
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
-
-    def _apply_snapkv_pre_decode(self, batch: ScheduleBatch):
-        """Apply SnapKV's prompt-compaction physical KV length shrink to the
-        batch seq_lens tensors before prepare_for_decode advances them. Requests
-        were already registered at prefill time (get_new_batch_prefill), and the
-        compaction happened during the prefill forward, so here we only drain the
-        pending physical lengths."""
-        updates = self.snapkv_compressor.take_pending_length_updates()
-        if not updates:
-            return
-        for i, req in enumerate(batch.reqs):
-            new_len = updates.get(req.req_pool_idx)
-            if new_len is not None:
-                batch.seq_lens[i] = new_len
-                batch.seq_lens_cpu[i] = new_len
-                batch.orig_seq_lens[i] = new_len
 
     def _apply_rkv_prefill_pre_decode(self, batch: ScheduleBatch):
         """Drain R-KV prefill's pending physical KV length shrink into the batch

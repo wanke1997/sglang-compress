@@ -1,8 +1,8 @@
 """R-KV as a **prefill-phase** KV-cache compressor (pure, device-agnostic).
 
-This module explores using R-KV (attention *importance* combined with key
-*redundancy*) to compress a long prompt right after prefill, the way SnapKV
-does — but with R-KV's scoring, which adds an ``O(n^2)`` pairwise-key-similarity
+This module uses R-KV (attention *importance* combined with key *redundancy*) to
+compress a long prompt right after prefill: keep the ``budget`` most
+important / least-redundant tokens, which adds an ``O(n^2)`` pairwise-key-similarity
 term. It implements two strategies and the primitives to diff-test one against
 the other:
 
