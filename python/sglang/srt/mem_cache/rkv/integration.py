@@ -116,23 +116,25 @@ class RKVRequestState:
         self.device = device
         self.dtype = dtype
 
-        # Generated steps since the last compaction (trigger cadence counter).
+        # Generated steps since the last compaction (trigger cadence counter),
+        # advanced once per decode step by ``RKVCompressor.begin_decode_step``
+        # (which runs every step, unlike ``observe_decode_layer`` which is
+        # skipped on CUDA-graph-replayed steps).
         self.steps_since_compact = 0
 
-        # Logical absolute position of the request's next token. Decoupled from
-        # the physical KV length so that rotary positions stay continuous after
-        # tokens are dropped. Set to the prompt length in ``on_request_begin``.
+        # Logical absolute position of the request's next token (vestigial:
+        # decode positions are derived from the request in
+        # ``override_decode_positions``, not from this field).
         self.next_position = 0
 
-        # Per-layer ring buffer of the most recent ``window_size`` decode
-        # queries: (num_layers, window_size, q_head_num, head_dim). Allocated
-        # lazily on the first ``push_query`` once the query shape is known.
-        self.query_window: Optional[torch.Tensor] = None
-        # Number of valid queries currently in the window (<= window_size).
-        self.query_filled = 0
-        # Write cursor into the ring buffer; advanced once per decode *step*
-        # (shared by all layers within that step).
-        self._write_pos = 0
+        # Per-layer observation-window queries, shape
+        # (num_layers, window_size, q_head_num, head_dim). Filled over the
+        # ``window_size`` decode steps ending at a compaction; those steps are
+        # forced to run eager so this hook actually executes. Allocated lazily.
+        self.window_q: Optional[torch.Tensor] = None
+        # Slot in ``window_q`` to write this step's query into (set by
+        # ``begin_decode_step``); -1 means this step is not a window step.
+        self.this_step_window_slot: int = -1
 
         # Transient cross-layer per-token score accumulator, allocated lazily at
         # the start of a compaction step and cleared afterwards.
@@ -144,42 +146,25 @@ class RKVRequestState:
         # origin_input_ids / output_ids. Set in ``on_request_begin``.
         self.req: Optional[Req] = None
 
-    def begin_step(self) -> None:
-        """Advance the ring cursor at the start of a new decode step."""
-        self._write_pos = (self._write_pos + 1) % self.window_size
-        self.query_filled = min(self.query_filled + 1, self.window_size)
-        self.steps_since_compact += 1
-        self.next_position += 1
+    def write_window(self, layer_idx: int, q: torch.Tensor) -> None:
+        """Write this step's query into the observation window.
 
-    def push_query(self, layer_idx: int, q: torch.Tensor) -> None:
-        """Store this step's query for ``layer_idx``.
-
-        ``q`` is ``(q_head_num, head_dim)`` (batch=1, single decode token). The
-        per-layer ring buffer is allocated on first use from ``q``'s shape.
+        ``q`` is ``(q_head_num, head_dim)``. No-op unless this step is a window
+        step (``this_step_window_slot >= 0``, set by ``begin_decode_step``). The
+        per-layer buffer is allocated lazily from ``q``'s shape. Temporal order
+        is guaranteed by the slot index: slot 0 is the oldest window token,
+        ``window_size - 1`` the newest (the compaction step itself).
         """
-        if self.query_window is None:
+        if self.this_step_window_slot < 0:
+            return
+        if self.window_q is None:
             q_head_num, head_dim = q.shape[-2], q.shape[-1]
-            self.query_window = torch.zeros(
+            self.window_q = torch.zeros(
                 (self.num_layers, self.window_size, q_head_num, head_dim),
                 device=self.device,
                 dtype=q.dtype,
             )
-        self.query_window[layer_idx, self._write_pos].copy_(q)
-
-    def ordered_window(self, layer_idx: int) -> torch.Tensor:
-        """Return the window queries for a layer in temporal order.
-
-        Shape ``(window_size, q_head_num, head_dim)``; oldest first, newest
-        last, matching what :meth:`R1KV._scores` expects for the observation
-        window.
-        """
-        # Roll the ring so the oldest valid entry comes first.
-        order = (
-            torch.arange(self.window_size, device=self.query_window.device)
-            + self._write_pos
-            + 1
-        ) % self.window_size
-        return self.query_window[layer_idx].index_select(0, order)
+        self.window_q[layer_idx, self.this_step_window_slot].copy_(q)
 
 
 class RKVCompressor:
@@ -255,9 +240,101 @@ class RKVCompressor:
                 len(self.states),
             )
 
+    def on_request_retract(self, req: Req) -> None:
+        """Discard a retracted request's R-KV state.
+
+        Retraction frees the request's physical KV and sends it back to the
+        waiting queue to be re-prefilled from scratch. Its old state (compaction
+        counter, observation-window queries, physical-length bookkeeping) no
+        longer matches the freed KV, so drop it here; a clean state is rebuilt by
+        ``on_request_begin`` when the request re-enters decode. Must be called
+        while ``req.req_pool_idx`` is still valid, i.e. BEFORE the pool frees it.
+        """
+        if req.req_pool_idx is not None:
+            self.states.pop(req.req_pool_idx, None)
+
+    # ------------------------------------------------------------------
+    # Scheduler admission support
+    # ------------------------------------------------------------------
+    def admission_reserve(self, prompt_len: int, occupied: int) -> int:
+        """Upper bound on the *future* physical KV a request can still consume.
+
+        R-KV holds a request's physical KV cache at a constant ceiling no matter
+        how many tokens it will still generate: it lets the length grow to at
+        most ``max(prompt_len, min_seq_len) + buffer_size`` (the peak reached the
+        step just before a compaction) and then frees back down to ``budget``.
+        So the scheduler only needs to reserve ``ceiling - occupied`` for a
+        request, NOT its full remaining ``max_new_tokens``. Reserving this (much
+        smaller) bound is what lets many more R-KV requests run concurrently.
+
+        The bound is deliberately the pre-compaction PEAK, so it is never an
+        underestimate: a request's physical KV can never exceed it, hence
+        admission can never over-commit the pool (memory-safe). ``occupied`` is
+        the request's current physical KV length (its committed length, or its
+        prompt length before prefill).
+        """
+        ceiling = max(prompt_len, self.config.min_seq_len) + self.config.buffer_size
+        return max(0, ceiling - occupied)
+
     # ------------------------------------------------------------------
     # Decode-time observation (called per layer from forward_decode)
     # ------------------------------------------------------------------
+    def begin_decode_step(self, forward_batch: ForwardBatch) -> bool:
+        """Advance per-request decode counters and decide graph-vs-eager.
+
+        Called once per decode step in ``ModelRunner.forward`` BEFORE the
+        graph/eager decision, so it runs on EVERY step — including steps that
+        will replay a captured CUDA graph, where ``observe_decode_layer`` (a
+        Python hook inside ``forward_decode``) is skipped.
+
+        For each managed request it advances ``steps_since_compact`` (only once
+        the request is long enough to compress, ``seq_len >= min_seq_len``),
+        marks whether this step is one of the ``window_size`` steps ending at the
+        next compaction (setting ``this_step_window_slot`` so the eager
+        ``observe`` writes its query), and arms the compaction on the final
+        window step.
+
+        Returns True if ANY request needs this step to run eager (a window step
+        or the compaction step). The caller disables the CUDA graph for this
+        step so ``observe_decode_layer`` / ``maybe_compact`` execute; all other
+        steps replay the graph.
+        """
+        if not self.states:
+            return False
+        req_indices = forward_batch.req_pool_indices.tolist()
+        seq_lens_src = forward_batch.seq_lens_cpu
+        if seq_lens_src is None:
+            seq_lens_src = forward_batch.seq_lens
+        seq_lens = seq_lens_src.tolist()
+
+        window = self.config.window_size
+        buffer = self.config.buffer_size
+        first_window_step = buffer - window + 1  # steps_since_compact of slot 0
+        need_eager = False
+        for i, req_pool_idx in enumerate(req_indices):
+            state = self.states.get(int(req_pool_idx))
+            if state is None:
+                continue
+            state.next_position += 1
+            state.this_step_window_slot = -1
+            # Only start the compaction clock once the request can actually be
+            # compressed; below budget there is nothing to evict.
+            if int(seq_lens[i]) < self.config.min_seq_len:
+                continue
+            state.steps_since_compact += 1
+            steps = state.steps_since_compact
+            if steps >= first_window_step:
+                slot = steps - first_window_step
+                if 0 <= slot < window:
+                    state.this_step_window_slot = slot
+                    need_eager = True
+                if steps >= buffer:
+                    # Compaction step: arm scoring (accumulated in observe over
+                    # this same eager forward, then consumed by maybe_compact).
+                    self._armed.add(int(req_pool_idx))
+                    state.score_accum = None
+        return need_eager
+
     def observe_decode_layer(
         self,
         q: torch.Tensor,
@@ -266,27 +343,23 @@ class RKVCompressor:
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> None:
-        """Observe one layer's decode step for every request in the batch.
+        """Capture window queries and (on the compaction step) accumulate scores.
 
-        Called from ``FlashInferAttnBackend.forward_decode`` *after*
-        ``set_kv_buffer`` (new K/V already in the pool) and *before* the
-        attention wrapper runs.
-
-        Supports ``batch >= 1`` with **per-request triggering** (method A): each
-        request independently arms a compaction once its own KV length reaches
-        ``min_seq_len`` and ``buffer_size`` steps have elapsed since its last
-        compaction. Row ``i`` of ``q`` / ``req_pool_indices`` / ``seq_lens`` all
-        refer to the same request (decode batches are aligned, one token/req).
-
-        Responsibilities per request:
-          * cache this layer's query into the observation window;
-          * when a compaction is armed for this step, compute this layer's
-            per-token score and accumulate it across layers.
+        Called per layer from ``FlashInferAttnBackend.forward_decode`` *after*
+        ``set_kv_buffer`` — but only on EAGER decode steps (graph-replayed steps
+        skip this Python hook; ``begin_decode_step`` forces window/compaction
+        steps to run eager so this executes for them). Counters and arming are
+        owned by ``begin_decode_step``; here we only:
+          * write this layer's query into the observation window (window steps);
+          * on the compaction step (armed), compute + accumulate the layer score.
         """
+        # No managed requests => nothing to do. This early return is also what
+        # keeps CUDA-graph CAPTURE clean: capture runs dummy decode forwards with
+        # an empty ``states``, and returning before the ``.tolist()`` host syncs
+        # avoids a device<->host copy inside the graph capture region.
+        if not self.states:
+            return
         layer_idx = layer.layer_id - self.start_layer
-
-        # One host sync per layer call (not per request): pull the batch's
-        # req_pool_indices and physical seq_lens to CPU.
         req_indices = forward_batch.req_pool_indices.tolist()
         seq_lens_src = forward_batch.seq_lens_cpu
         if seq_lens_src is None:
@@ -299,26 +372,12 @@ class RKVCompressor:
             if state is None:
                 continue
 
-            seq_len = int(seq_lens[i])
-
-            # Arm/advance once per step, on the first layer we see.
-            if layer_idx == 0:
-                state.begin_step()
-                if (
-                    state.steps_since_compact >= self.config.buffer_size
-                    and seq_len >= self.config.min_seq_len
-                ):
-                    self._armed.add(req_pool_idx)
-                    # Accumulator over past tokens, filled lazily below.
-                    state.score_accum = None
-
-            # q[i] is (q_head_num, head_dim) for this request's single decode
-            # token; store it in the per-request ring buffer.
+            # Write this layer's query into the window (no-op off window steps).
             q_i = q[i]
-            state.push_query(layer_idx, q_i.reshape(q_i.shape[-2], q_i.shape[-1]))
+            state.write_window(layer_idx, q_i.reshape(q_i.shape[-2], q_i.shape[-1]))
 
             if req_pool_idx in self._armed:
-                layer_score = self._layer_score(state, layer_idx, seq_len)
+                layer_score = self._layer_score(state, layer_idx, int(seq_lens[i]))
                 if state.score_accum is None:
                     state.score_accum = layer_score
                 else:
@@ -340,8 +399,10 @@ class RKVCompressor:
         # (num_slots, kv_heads, head_dim); gather this request's slots.
         keys = k_buffer[slots].unsqueeze(0).transpose(1, 2).contiguous()
 
-        # queries: (1, q_heads, window_size, head_dim)
-        window_q = state.ordered_window(layer_idx)  # (window, q_heads, head_dim)
+        # queries: (1, q_heads, window_size, head_dim). window_q is filled in
+        # temporal order (slot 0 oldest .. window_size-1 newest) over the eager
+        # window steps that begin_decode_step forced before this compaction.
+        window_q = state.window_q[layer_idx]  # (window, q_heads, head_dim)
         queries = window_q.unsqueeze(0).transpose(1, 2).contiguous()
 
         # (1, kv_heads, seq_len - window) -> mean over heads -> (seq_len - window,)

@@ -105,6 +105,10 @@ class _MockReq:
         self.kv_allocated_len = origin_len + output_len
         self.req_pool_idx = req_pool_idx
 
+    @property
+    def seqlen(self):
+        return len(self.origin_input_ids) + len(self.output_ids)
+
 
 class _MockLayer:
     def __init__(self, layer_id: int):
@@ -330,6 +334,42 @@ class TestObserveAndCompactEndToEnd(unittest.TestCase):
         # armed set cleared
         self.assertEqual(len(self.comp._armed), 0)
 
+    def test_reprefill_after_retract_frees_regenerated_slots(self):
+        # A retracted request keeps its output_ids and re-prefills
+        # origin_input_ids + output_ids, allocating (origin + output) KV slots.
+        # Compaction must free the FULL physical tail, not orphan the
+        # regenerated output slots (KV-pool leak regression).
+        origin, output = self.seq_len, 12
+        n = origin + output  # physical prefill length after re-prefill
+        slots = torch.arange(n, dtype=torch.int32)
+        self.r2t_pool.req_to_token[self.req_pool_idx, :n] = slots
+
+        req = _MockReq(
+            origin_len=origin, output_len=output, req_pool_idx=self.req_pool_idx
+        )
+        self.comp.on_request_begin(req)
+        # prompt_len tracks the full physical length (origin + output).
+        self.assertEqual(self.comp.states[self.req_pool_idx].prompt_len, n)
+
+        fb = _MockForwardBatch(
+            req_pool_indices=[self.req_pool_idx],
+            seq_lens=[n],
+            extend_seq_lens=[n],
+        )
+        torch.manual_seed(11)
+        for layer_id in range(self.num_layers):
+            q = torch.randn(n, self.q_heads, self.head_dim)
+            self.comp.observe_prefill_layer(q, None, None, _MockLayer(layer_id), fb)
+        self.comp.maybe_compact(fb)
+
+        # Frees the full tail (n - budget); no output slot left orphaned.
+        self.assertEqual(len(self.alloc.freed), 1)
+        self.assertEqual(self.alloc.freed[0].numel(), n - self.budget)
+        r2t = self.r2t_pool.req_to_token
+        self.assertTrue(bool((r2t[self.req_pool_idx, self.budget : n] == 0).all()))
+        self.assertEqual(req.kv_committed_len, self.budget)
+        self.assertEqual(req.kv_allocated_len, self.budget)
+
     def test_below_budget_prompt_is_untouched(self):
         short = 10  # < budget
         req = _MockReq(origin_len=short, output_len=0, req_pool_idx=self.req_pool_idx)
@@ -383,6 +423,40 @@ class TestLifecycleAndPositions(unittest.TestCase):
         comp.override_decode_positions(fb)
         # logical position = origin(30) + output(5) - 1 = 34
         self.assertEqual(int(fb.positions[0].item()), 34)
+
+
+class TestRequestWantsCompression(unittest.TestCase):
+    """The per-request gate: only task_type == 'summarization' opts in."""
+
+    def _req(self, task_type):
+        return types.SimpleNamespace(task_type=task_type, req_pool_idx=1)
+
+    def test_summarization_opts_in(self):
+        self.assertTrue(
+            SnapKVCompressor.request_wants_compression(self._req("summarization"))
+        )
+
+    def test_case_and_whitespace_insensitive(self):
+        for val in (" Summarization ", "SUMMARIZATION", "summarization\n"):
+            self.assertTrue(
+                SnapKVCompressor.request_wants_compression(self._req(val)),
+                f"should match: {val!r}",
+            )
+
+    def test_other_or_missing_stays_full_kv(self):
+        for val in (None, "", "classification", "choose", "summarize"):
+            self.assertFalse(
+                SnapKVCompressor.request_wants_compression(self._req(val)),
+                f"should NOT match: {val!r}",
+            )
+
+    def test_req_without_task_type_attr(self):
+        # A Req lacking the attribute entirely must not raise -> full KV.
+        self.assertFalse(
+            SnapKVCompressor.request_wants_compression(
+                types.SimpleNamespace(req_pool_idx=1)
+            )
+        )
 
 
 if __name__ == "__main__":

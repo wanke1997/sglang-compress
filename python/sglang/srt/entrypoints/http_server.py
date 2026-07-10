@@ -768,6 +768,11 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    # Per-request task-type hint (e.g. "summarization") from the HTTP header,
+    # used to selectively enable SnapKV prompt compression. An explicit body
+    # value, if present, takes precedence over the header.
+    if obj.task_type is None:
+        obj.task_type = request.headers.get("task_type")
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

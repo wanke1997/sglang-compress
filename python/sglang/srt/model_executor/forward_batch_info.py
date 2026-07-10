@@ -801,6 +801,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
+            # SnapKV: after its one-time prompt compaction, seq_lens tracks the
+            # shrunken PHYSICAL KV length, so clamp_position(seq_lens) would
+            # rewind rotary. Restore *logical* positions here — at ForwardBatch
+            # construction — so BOTH the eager forward and the CUDA-graph replay
+            # (which copies forward_batch.positions into its graph input buffer)
+            # observe the correct positions. This is what makes decode CUDA
+            # graph compatible with SnapKV. No-op when SnapKV is off or idle.
+            snapkv_comp = getattr(model_runner, "snapkv_compressor", None)
+            if snapkv_comp is not None and snapkv_comp.states:
+                snapkv_comp.override_decode_positions(ret)
+            # R-KV prefill: identical rationale — seq_lens tracks the shrunk
+            # physical KV length after prompt compaction; restore logical
+            # positions so eager and CUDA-graph-replay decode both see them.
+            rkv_prefill_comp = getattr(model_runner, "rkv_prefill_compressor", None)
+            if rkv_prefill_comp is not None and rkv_prefill_comp.states:
+                rkv_prefill_comp.override_decode_positions(ret)
+            # R-KV decode: same again — mid-generation eviction shrinks seq_lens,
+            # so restore logical positions at construction. This is what lets the
+            # decode CUDA graph stay on for R-KV (graph-replay steps copy
+            # forward_batch.positions into the graph input buffer).
+            rkv_comp = getattr(model_runner, "rkv_compressor", None)
+            if rkv_comp is not None and rkv_comp.states:
+                rkv_comp.override_decode_positions(ret)
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.

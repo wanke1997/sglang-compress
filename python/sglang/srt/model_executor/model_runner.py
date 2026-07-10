@@ -419,6 +419,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_rkv = server_args.enable_rkv
         self.enable_snapkv = server_args.enable_snapkv
+        self.enable_rkv_prefill = server_args.enable_rkv_prefill
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -573,6 +574,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For SnapKV prompt-phase KV compression (constructed in alloc_memory_pool).
         self.snapkv_compressor = None
+        # For R-KV prefill (prompt-phase) KV compression (constructed in alloc_memory_pool).
+        self.rkv_prefill_compressor = None
 
         self._linear_attn_registry_cache: Any = _UNSET
 
@@ -912,6 +915,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 start_layer=self.start_layer,
                 end_layer=self.start_layer + self.num_effective_layers,
                 device=self.device,
+                enable_overlap=not self.server_args.disable_overlap_schedule,
+            )
+
+        if self.enable_rkv_prefill:
+            import json
+
+            from sglang.srt.mem_cache.rkv.prefill_integration import (
+                RKVPrefillCompressor,
+                RKVPrefillConfig,
+            )
+
+            rkv_prefill_cfg_dict = {}
+            if self.server_args.rkv_prefill_config:
+                rkv_prefill_cfg_dict.update(
+                    json.loads(self.server_args.rkv_prefill_config)
+                )
+            self.rkv_prefill_compressor = RKVPrefillCompressor(
+                config=RKVPrefillConfig(**rkv_prefill_cfg_dict),
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                kv_allocator=self.token_to_kv_pool_allocator,
+                start_layer=self.start_layer,
+                end_layer=self.start_layer + self.num_effective_layers,
+                device=self.device,
+                enable_overlap=not self.server_args.disable_overlap_schedule,
             )
 
         self.init_routed_experts_capturer()
@@ -3069,10 +3097,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
+            # R-KV decode: advance per-request compaction counters EVERY decode
+            # step (this must run even on graph-replay steps, where the
+            # observe_decode_layer hook inside forward_decode is skipped) and
+            # force this step to run eager when it falls in an observation window
+            # or is a compaction step, so observe + maybe_compact execute.
+            rkv_force_eager = (
+                forward_batch.forward_mode.is_decode()
+                and self.rkv_compressor is not None
+                and self.rkv_compressor.begin_decode_step(forward_batch)
+            )
             can_run_graph = bool(
                 mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                and not rkv_force_eager
             )
 
             if (
@@ -3158,6 +3197,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # observation window, keep the budget, free the rest, rewrite
                 # req_to_token, shrink physical lengths for decode).
                 self.snapkv_compressor.maybe_compact(forward_batch)
+
+            if (
+                forward_batch.forward_mode.is_extend()
+                and self.rkv_prefill_compressor is not None
+            ):
+                # R-KV prefill compaction (same timing as SnapKV): score the
+                # observation window with R-KV importance+redundancy, keep the
+                # budget, free the rest, rewrite req_to_token, shrink lengths.
+                self.rkv_prefill_compressor.maybe_compact(forward_batch)
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

@@ -107,6 +107,16 @@ class SnapKVRequestState:
         # Physical KV length observed when scores were accumulated.
         self.observed_seq_len: int = 0
 
+        # Full prompt length (KV tokens); set in ``on_request_begin``. Used to
+        # locate the observation window even when the prompt is prefilled in
+        # multiple chunks (the pooled seq_len is partial mid-prefill).
+        self.prompt_len: int = 0
+        # Per-layer buffer of the observation-window prompt queries, filled
+        # incrementally across (possibly chunked) prefill forwards. Shape
+        # (num_layers, window_size, q_heads, head_dim); allocated lazily and
+        # freed after compaction.
+        self.window_q: Optional[torch.Tensor] = None
+
         # Back-reference to the owning request, so compaction can update its
         # physical-length bookkeeping (kv_committed_len / kv_allocated_len) and
         # so decode positions can be kept logical. Duck-typed: only needs
@@ -131,6 +141,7 @@ class SnapKVCompressor:
         start_layer: int,
         end_layer: int,
         device: torch.device,
+        enable_overlap: bool = False,
     ) -> None:
         self.config = config
         self.req_to_token_pool = req_to_token_pool
@@ -140,6 +151,10 @@ class SnapKVCompressor:
         self.end_layer = end_layer
         self.num_layers = end_layer - start_layer
         self.device = device
+        # Under overlap scheduling the just-sampled token is not yet appended to
+        # req.output_ids when the next ForwardBatch is built (one-step delay), so
+        # the logical decode position must NOT subtract the extra 1.
+        self.enable_overlap = enable_overlap
 
         # Active per-request state, keyed by req_pool_idx.
         self.states: Dict[int, SnapKVRequestState] = {}
@@ -153,12 +168,29 @@ class SnapKVCompressor:
     # ------------------------------------------------------------------
     # Request lifecycle
     # ------------------------------------------------------------------
+    @staticmethod
+    def request_wants_compression(req: Req) -> bool:
+        """Whether a request opts into SnapKV prompt compression.
+
+        Gated on the request's ``task_type`` (populated from the ``task_type``
+        HTTP header): only ``"summarization"`` requests are compressed; any
+        other value, or a missing / empty hint, leaves the request on full KV.
+        """
+        task_type = getattr(req, "task_type", None)
+        return (task_type or "").strip().lower() == "summarization"
+
     def on_request_begin(self, req: Req) -> None:
         """Register a request and initialise its SnapKV state."""
         if req.req_pool_idx is None:
             return
         state = SnapKVRequestState(req_pool_idx=req.req_pool_idx)
         state.req = req
+        # Full physical prefill length = len(origin_input_ids) + len(output_ids),
+        # NOT just the prompt. A retracted request keeps its output_ids and
+        # re-prefills origin_input_ids + output_ids, allocating that many KV
+        # slots. Keying compaction off the original prompt length would leave the
+        # regenerated output slots orphaned in the pool (KV leak).
+        state.prompt_len = req.seqlen
         self.states[req.req_pool_idx] = state
 
     def on_request_end(self, req: Req) -> None:
@@ -169,6 +201,34 @@ class SnapKVCompressor:
                 req.req_pool_idx,
                 len(self.states),
             )
+
+    def on_request_retract(self, req: Req) -> None:
+        """Drop state on retraction so the re-prefill rebuilds cleanly.
+
+        Must run while ``req_pool_idx`` is still valid (before the pool frees
+        it). A retained state (``compressed=True`` / stale ``observed_seq_len``)
+        would make the re-prefilled request skip compaction or free the wrong
+        tail slots, leaking KV pool memory.
+        """
+        idx = req.req_pool_idx
+        if idx is None:
+            return
+        self.states.pop(idx, None)
+        self.pending_length_updates.pop(idx, None)
+        self._armed.discard(idx)
+
+    def admission_steady_prompt_len(self, prompt_len: int) -> int:
+        """Post-compaction resident prompt length, for compression-aware admission.
+
+        A prompt-phase compressor frees the prompt down to ``max_capacity_prompt``
+        at the end of prefill, so a request's steady-state (decode-time) physical
+        KV is ``min(prompt_len, max_capacity_prompt) + generated_tokens`` — NOT
+        ``prompt_len + ...``. The scheduler reserves this smaller lifetime
+        footprint (while still gating the transient full-prompt prefill on its
+        own), which is what lets many more compressed requests decode
+        concurrently.
+        """
+        return min(prompt_len, self.config.max_capacity_prompt)
 
     # ------------------------------------------------------------------
     # Prefill-time observation (called per layer from forward_extend)
@@ -203,6 +263,7 @@ class SnapKVCompressor:
         if extend_lens is None:
             return
 
+        window = self.config.window_size
         # Per-request start offset into the flattened extend token dimension.
         offset = 0
         for i, req_pool_idx in enumerate(req_indices):
@@ -215,28 +276,50 @@ class SnapKVCompressor:
             if state is None or state.compressed:
                 continue
 
-            seq_len = int(seq_lens[i])
-            # Only compress once the (full) prompt exceeds the budget. Requires
-            # the whole prompt in this single forward (chunked prefill disabled),
-            # i.e. extend_len == seq_len.
-            if seq_len <= self.config.max_capacity_prompt:
+            # Only compress prompts whose FULL length exceeds the budget. The
+            # full length is known up front (from the request), so this holds
+            # even mid-prefill when the pooled seq_len is still partial.
+            prompt_len = state.prompt_len
+            if prompt_len <= self.config.max_capacity_prompt:
                 continue
-            if extend_len < seq_len or extend_len <= self.config.window_size:
+
+            seq_len = int(seq_lens[i])  # KV tokens in the pool after this chunk
+            prefix = seq_len - extend_len  # tokens prefilled before this chunk
+            w0 = prompt_len - window  # observation-window start (global index)
+
+            # Capture this chunk's slice of the observation window (the last
+            # ``window`` prompt tokens) into the per-layer buffer. With chunked
+            # prefill the window can straddle chunk boundaries, so the buffer is
+            # filled incrementally; for single-shot prefill the whole window
+            # lands in one chunk.
+            ov_start = max(prefix, w0)
+            ov_end = min(prefix + extend_len, prompt_len)
+            if ov_end > ov_start:
+                if state.window_q is None:
+                    q_heads, head_dim = q.shape[-2], q.shape[-1]
+                    state.window_q = torch.zeros(
+                        (self.num_layers, window, q_heads, head_dim),
+                        device=q.device,
+                        dtype=q.dtype,
+                    )
+                state.window_q[layer_idx, ov_start - w0 : ov_end - w0] = q[
+                    start + (ov_start - prefix) : start + (ov_end - prefix)
+                ]
+
+            # Score + arm only on the FINAL prefill chunk: by then every prompt
+            # key is pooled and this layer's window buffer is complete (the
+            # window's tail always lands in the final chunk).
+            if prefix + extend_len < prompt_len:
                 continue
 
             if layer_idx == 0:
                 self._armed.add(req_pool_idx)
                 state.score_accum = None
-                state.observed_seq_len = seq_len
+                state.observed_seq_len = prompt_len
 
-            if req_pool_idx in self._armed:
-                # Window queries for this request: the last window_size rows of
-                # its extend block, shape (window, q_heads, head_dim).
-                window_q = q[
-                    start + extend_len - self.config.window_size : start + extend_len
-                ]
+            if req_pool_idx in self._armed and state.window_q is not None:
                 layer_score = self._layer_score(
-                    req_pool_idx, seq_len, window_q, layer_idx
+                    req_pool_idx, prompt_len, state.window_q[layer_idx], layer_idx
                 )
                 if state.score_accum is None:
                     state.score_accum = layer_score
@@ -347,6 +430,7 @@ class SnapKVCompressor:
         r2t[idx, budget:seq_len] = 0
 
         state.compressed = True
+        state.window_q = None  # free the transient observation-window buffer
 
         # Physical-length bookkeeping. The scheduler normally treats seq_lens as
         # BOTH the physical KV length AND the rotary position source; SnapKV
@@ -421,4 +505,8 @@ class SnapKVCompressor:
         for i in range(req_indices.shape[0]):
             st = self.states.get(int(req_indices[i].item()))
             if st is not None and st.req is not None:
-                forward_batch.positions[i] = self.logical_position(st.req) - 1
+                # Overlap delays output_ids by one token, so logical_position is
+                # already one short then; drop the -1 in that case.
+                forward_batch.positions[i] = self.logical_position(st.req) - (
+                    0 if self.enable_overlap else 1
+                )

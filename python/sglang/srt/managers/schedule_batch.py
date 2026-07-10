@@ -708,6 +708,7 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        task_type: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -782,6 +783,9 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        # Task-type hint (e.g. "summarization") used to selectively enable
+        # SnapKV prompt compression for this request.
+        self.task_type = task_type
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -1612,9 +1616,18 @@ def release_req(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
+    retract_compressors: tuple = (),
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
+
+    # Drop each compressor's per-request state while req_pool_idx is still valid
+    # (req_to_token_pool.free below sets it to None). The physical KV is about to
+    # be freed; a retained state would carry stale compaction bookkeeping into
+    # the request's next prefill+decode (a prompt-phase compressor would skip
+    # re-compaction and leak KV slots; decode R-KV would mis-drive compaction).
+    for compressor in retract_compressors:
+        compressor.on_request_retract(req)
 
     if server_args.disaggregation_mode == "decode":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
@@ -1635,6 +1648,7 @@ def retract_all(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
+    retract_compressors: tuple = (),
 ) -> List[Req]:
     retracted_reqs = reqs
     for idx in range(len(reqs)):
@@ -1646,6 +1660,7 @@ def retract_all(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
+            retract_compressors=retract_compressors,
         )
     return retracted_reqs
 
@@ -1689,6 +1704,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # HiSparse (engine-level coordinator ref, same across batches)
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    # Compressors (engine-level refs, same across batches) whose per-request
+    # state must be dropped when a request is retracted, while its req_pool_idx
+    # is still valid. release_req / retract_all call on_request_retract on each.
+    retract_compressors: tuple = ()
 
     # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
     # Tell whether the current running batch is full so that we can skip
@@ -2451,6 +2471,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            retract_compressors=self.retract_compressors,
         )
         self.reqs = []
         return retracted_reqs
@@ -2528,6 +2549,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            retract_compressors=self.retract_compressors,
         )
 
     def prepare_encoder_info_decode(self):

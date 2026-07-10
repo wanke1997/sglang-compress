@@ -1918,6 +1918,19 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # R-KV prefill (prompt-phase KV compression using R-KV importance+redundancy)
+    # -------------------------------------------------------------------------
+    enable_rkv_prefill: A[
+        bool, "Enable R-KV prompt-phase (prefill) KV cache compression"
+    ] = False
+    rkv_prefill_config: A[
+        Optional[str],
+        Arg(
+            help='A dictionary in JSON string format configuring R-KV prefill compression (fields mirror RKVPrefillConfig). Example: \'{"mode": "oneshot", "budget": 1024, "window_size": 32, "mix_lambda": 0.1, "buffer": 512}\'. mode is "oneshot" (route A) or "buffered" (route B).',
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
@@ -2580,6 +2593,8 @@ class ServerArgs:
 
         self._handle_snapkv_validation()
 
+        self._handle_rkv_prefill_validation()
+
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
@@ -2995,9 +3010,15 @@ class ServerArgs:
 
         See R-KV/doc/DESIGN.md: R-KV physically frees KV slots mid-generation,
         which is incompatible with prefix caching (the radix tree would keep
-        references into freed slots), captured decode CUDA graphs (eviction is
-        dynamic), page_size > 1 (per-slot free), overlap scheduling (phase 1),
-        and TP > 1 (per-rank eviction would diverge).
+        references into freed slots), page_size > 1 (per-slot free), overlap
+        scheduling (phase 1), and TP > 1 (per-rank eviction would diverge).
+
+        Decode CUDA graph IS supported: a per-step hook
+        (``RKVCompressor.begin_decode_step``) advances the compaction counters
+        on every step and forces the ``window_size`` steps ending at each
+        compaction (plus the compaction step) to run eager, while all other
+        decode steps replay the captured graph; logical positions are restored
+        at ForwardBatch construction so graph-replay steps see them too.
         """
         if not self.enable_rkv:
             return
@@ -3005,11 +3026,6 @@ class ServerArgs:
             raise ValueError(
                 "--enable-rkv requires --disable-radix-cache: R-KV frees KV "
                 "slots that the radix/prefix cache would still reference."
-            )
-        if not (self.disable_decode_cuda_graph or self.disable_cuda_graph):
-            raise ValueError(
-                "--enable-rkv requires --disable-decode-cuda-graph: dynamic "
-                "eviction cannot run inside a captured CUDA graph."
             )
         if not self.disable_overlap_schedule:
             raise ValueError(
@@ -3020,18 +3036,81 @@ class ServerArgs:
         if self.tp_size > 1:
             raise ValueError("--enable-rkv does not support tensor parallelism yet.")
 
+    def _handle_rkv_prefill_validation(self):
+        """Enforce the invariants R-KV prefill compression depends on.
+
+        R-KV prefill physically frees prompt KV slots right after prefill (like
+        SnapKV), so it needs prefix caching off, the prefill CUDA graph off
+        (prompt-phase scoring/compaction are dynamic), overlap scheduling off,
+        page_size 1, and TP == 1.
+        Overlap scheduling is NOT supported: the prefill-end compaction frees KV
+        slots from inside the forward (on the forward stream), which races with
+        the overlap scheduler's async next-batch allocation on the same
+        ``free_pages`` tensor (default stream) — a torn read yields garbage slot
+        indices and an illegal memory access at scale. This is the same reason
+        the decode R-KV compressor requires overlap off. (seq_lens / rotary
+        positions are already overlap-correct; the allocator free is the blocker.)
+        Decode CUDA graph IS supported (logical positions restored
+        at ForwardBatch construction). It is mutually exclusive with the decode
+        R-KV compressor and with SnapKV (all own physical-length / rotary
+        bookkeeping). ``mode='buffered'`` (route B) does its segmented eviction
+        logically during prefill and one physical compaction at the end, so it
+        supports chunked prefill just like ``oneshot``.
+        """
+        if not self.enable_rkv_prefill:
+            return
+        if self.enable_rkv or self.enable_snapkv:
+            raise ValueError(
+                "--enable-rkv-prefill cannot be combined with --enable-rkv or "
+                "--enable-snapkv."
+            )
+        if not self.disable_radix_cache:
+            raise ValueError(
+                "--enable-rkv-prefill requires --disable-radix-cache: it frees KV "
+                "slots the radix/prefix cache would still reference."
+            )
+        if not (self.disable_prefill_cuda_graph or self.disable_cuda_graph):
+            raise ValueError(
+                "--enable-rkv-prefill requires --disable-prefill-cuda-graph: the "
+                "prompt-phase scoring and compaction are dynamic. (Decode CUDA "
+                "graph is supported and may stay enabled.)"
+            )
+        if not self.disable_overlap_schedule:
+            raise ValueError(
+                "--enable-rkv-prefill requires --disable-overlap-schedule: the "
+                "prefill-end compaction frees KV slots from inside the forward "
+                "(forward stream), which races with the overlap scheduler's "
+                "async next-batch allocation on the free-list (default stream) "
+                "and causes an illegal memory access at scale."
+            )
+        if self.page_size not in (None, 1):
+            raise ValueError(
+                "--enable-rkv-prefill requires --page-size 1 (per-slot free)."
+            )
+        if self.tp_size > 1:
+            raise ValueError(
+                "--enable-rkv-prefill does not support tensor parallelism yet."
+            )
+
     def _handle_snapkv_validation(self):
         """Enforce the invariants SnapKV's memory safety depends on.
 
         See SnapKV/doc/DESIGN.md: SnapKV physically frees prompt KV slots right
         after prefill, which is incompatible with prefix caching (the radix tree
-        would keep references into freed slots), captured decode CUDA graphs
-        (eviction/positions are dynamic), page_size > 1 (per-slot free), overlap
-        scheduling (phase 1), and TP > 1 (per-rank eviction would diverge). It
-        also needs the whole prompt in a single prefill forward so the
-        observation window is complete, hence chunked prefill must be disabled.
-        Cannot run alongside R-KV (both own the physical-length / rotary
-        bookkeeping).
+        would keep references into freed slots), captured prefill CUDA graphs
+        (the prompt-phase scoring and one-time compaction are dynamic), page_size
+        > 1 (per-slot free), and TP > 1 (per-rank eviction would diverge).
+        Overlap scheduling is NOT supported: the one-time prompt compaction frees
+        KV slots from inside the forward (forward stream), which races with the
+        overlap scheduler's async next-batch allocation on the same free-list
+        tensor (default stream), causing an illegal memory access at scale (the
+        same reason the decode R-KV compressor requires overlap off). Decode CUDA
+        graph and chunked prefill ARE supported: the only decode-time dynamic
+        (logical rotary positions) is applied at ForwardBatch construction,
+        consumed by both the eager and CUDA-graph-replay paths; the
+        observation-window queries are buffered across prefill chunks and scored
+        on the final chunk. Cannot run alongside R-KV (both own the
+        physical-length / rotary bookkeeping).
         """
         if not self.enable_snapkv:
             return
@@ -3044,27 +3123,25 @@ class ServerArgs:
                 "--enable-snapkv requires --disable-radix-cache: SnapKV frees KV "
                 "slots that the radix/prefix cache would still reference."
             )
-        if not (self.disable_decode_cuda_graph or self.disable_cuda_graph):
+        if not (self.disable_prefill_cuda_graph or self.disable_cuda_graph):
             raise ValueError(
-                "--enable-snapkv requires --disable-decode-cuda-graph: dynamic "
-                "positions after prompt eviction cannot run inside a captured "
-                "CUDA graph."
+                "--enable-snapkv requires --disable-prefill-cuda-graph: the "
+                "prompt-phase observation and one-time compaction are dynamic "
+                "and cannot run inside a captured prefill CUDA graph. (Decode "
+                "CUDA graph is supported and may stay enabled.)"
             )
         if not self.disable_overlap_schedule:
             raise ValueError(
-                "--enable-snapkv requires --disable-overlap-schedule (phase 1)."
+                "--enable-snapkv requires --disable-overlap-schedule: the "
+                "one-time prompt compaction frees KV slots from inside the "
+                "forward (forward stream), which races with the overlap "
+                "scheduler's async next-batch allocation on the free-list "
+                "(default stream) and causes an illegal memory access at scale."
             )
         if self.page_size not in (None, 1):
             raise ValueError("--enable-snapkv requires --page-size 1 (per-slot free).")
         if self.tp_size > 1:
             raise ValueError("--enable-snapkv does not support tensor parallelism yet.")
-        # Chunked prefill must be off so the full prompt (and its observation
-        # window queries) is processed in a single forward pass.
-        if self.chunked_prefill_size not in (None, -1):
-            raise ValueError(
-                "--enable-snapkv requires --chunked-prefill-size -1: SnapKV needs "
-                "the whole prompt in one prefill forward."
-            )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase

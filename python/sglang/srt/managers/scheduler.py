@@ -356,6 +356,8 @@ class Scheduler(
         self.rkv_compressor = None
         self.enable_snapkv = server_args.enable_snapkv
         self.snapkv_compressor = None
+        self.enable_rkv_prefill = server_args.enable_rkv_prefill
+        self.rkv_prefill_compressor = None
 
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
@@ -488,6 +490,12 @@ class Scheduler(
         if self.enable_snapkv:
             # SnapKVCompressor was created inside ModelRunner.alloc_memory_pool().
             self.snapkv_compressor = self.tp_worker.model_runner.snapkv_compressor
+
+        if self.enable_rkv_prefill:
+            # RKVPrefillCompressor was created inside ModelRunner.alloc_memory_pool().
+            self.rkv_prefill_compressor = (
+                self.tp_worker.model_runner.rkv_prefill_compressor
+            )
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -862,6 +870,10 @@ class Scheduler(
             self.rkv_compressor = self.tp_worker.model_runner.rkv_compressor
         if self.enable_snapkv:
             self.snapkv_compressor = self.tp_worker.model_runner.snapkv_compressor
+        if self.enable_rkv_prefill:
+            self.rkv_prefill_compressor = (
+                self.tp_worker.model_runner.rkv_prefill_compressor
+            )
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -2073,6 +2085,7 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                task_type=recv_req.task_type,
             )
             req.tokenizer = self.tokenizer
 
@@ -2810,6 +2823,13 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            rkv_compressor=self.rkv_compressor,
+            # SnapKV / R-KV-prefill are mutually exclusive and both compress the
+            # prompt at prefill end, so admission reserves their smaller
+            # steady-state footprint (min(prompt, budget) + max_new).
+            prompt_phase_compressor=(
+                self.snapkv_compressor or self.rkv_prefill_compressor
+            ),
         )
 
         if self.chunked_req is not None:
@@ -2952,9 +2972,20 @@ class Scheduler(
         # hook can find their per-request state.
         if self.snapkv_compressor is not None:
             for req in new_batch.reqs:
+                if not self.snapkv_compressor.request_wants_compression(req):
+                    continue
                 st = self.snapkv_compressor.states.get(req.req_pool_idx)
                 if st is None or st.req is not req:
                     self.snapkv_compressor.on_request_begin(req)
+
+        # R-KV prefill: same registration as SnapKV.
+        if self.rkv_prefill_compressor is not None:
+            for req in new_batch.reqs:
+                if not self.rkv_prefill_compressor.request_wants_compression(req):
+                    continue
+                st = self.rkv_prefill_compressor.states.get(req.req_pool_idx)
+                if st is None or st.req is not req:
+                    self.rkv_prefill_compressor.on_request_begin(req)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -3020,8 +3051,24 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _retract_compressors(self) -> tuple:
+        """Active KV compressors whose per-request state must be dropped on
+        retraction (decode R-KV + prompt-phase SnapKV / R-KV-prefill)."""
+        return tuple(
+            c
+            for c in (
+                self.rkv_compressor,
+                self.snapkv_compressor,
+                self.rkv_prefill_compressor,
+            )
+            if c is not None
+        )
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
+        # Give the batch the compressor refs so retraction (below) can drop a
+        # retracted request's compressor state before its physical KV is freed.
+        batch.retract_compressors = self._retract_compressors()
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
@@ -3117,6 +3164,10 @@ class Scheduler(
         if self.snapkv_compressor is not None:
             self._apply_snapkv_pre_decode(batch)
 
+        # R-KV prefill: same as SnapKV — drain the pending physical-length shrink.
+        if self.rkv_prefill_compressor is not None:
+            self._apply_rkv_prefill_pre_decode(batch)
+
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
@@ -3128,6 +3179,21 @@ class Scheduler(
         compaction happened during the prefill forward, so here we only drain the
         pending physical lengths."""
         updates = self.snapkv_compressor.take_pending_length_updates()
+        if not updates:
+            return
+        for i, req in enumerate(batch.reqs):
+            new_len = updates.get(req.req_pool_idx)
+            if new_len is not None:
+                batch.seq_lens[i] = new_len
+                batch.seq_lens_cpu[i] = new_len
+                batch.orig_seq_lens[i] = new_len
+
+    def _apply_rkv_prefill_pre_decode(self, batch: ScheduleBatch):
+        """Drain R-KV prefill's pending physical KV length shrink into the batch
+        seq_lens tensors before prepare_for_decode advances them. Requests were
+        registered at prefill time; compaction happened during the prefill
+        forward. Rotary stays logical via override_decode_positions."""
+        updates = self.rkv_prefill_compressor.take_pending_length_updates()
         if not updates:
             return
         for i, req in enumerate(batch.reqs):
@@ -4002,6 +4068,7 @@ class Scheduler(
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
+                self.running_batch.retract_compressors = self._retract_compressors()
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)

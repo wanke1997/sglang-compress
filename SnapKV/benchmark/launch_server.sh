@@ -26,13 +26,14 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 export PYTHONPATH="$REPO/python"
 export HF_HUB_DISABLE_XET=1  # HF Xet transfer can hang on large files
 
-# SnapKV requires: eager decode (dynamic positions after eviction), radix/prefix
-# cache OFF (SnapKV frees slots the radix tree still references), overlap OFF
-# (simple timing), page_size=1 (clean per-slot free), and chunked prefill OFF so
-# the whole prompt (and its observation window) is seen in a single forward.
-SNAPKV_FLAGS=(--disable-decode-cuda-graph --disable-prefill-cuda-graph
-              --disable-overlap-schedule --disable-radix-cache --page-size 1
-              --chunked-prefill-size -1)
+# SnapKV requires: radix/prefix cache OFF (SnapKV frees slots the radix tree
+# still references), overlap OFF (simple timing), page_size=1 (clean per-slot
+# free), and the *prefill* CUDA graph OFF (prompt-phase scoring/compaction are
+# dynamic). Decode CUDA graph IS supported (positions restored at ForwardBatch
+# construction) and chunked prefill IS supported (observation-window queries are
+# buffered across chunks and scored on the final chunk), so neither is disabled.
+SNAPKV_FLAGS=(--disable-prefill-cuda-graph
+              --disable-overlap-schedule --disable-radix-cache --page-size 1)
 
 COMMON=(--model-path "$MODEL" --attention-backend flashinfer
         --mem-fraction-static "$MEM_FRAC" --host 127.0.0.1 --port "$PORT")
