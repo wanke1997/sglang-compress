@@ -25,6 +25,7 @@ See ``R-KV/doc/DESIGN.md`` and the A/B diff-test in
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import msgspec
@@ -117,6 +118,7 @@ class RKVPrefillCompressor:
         device: torch.device,
         enable_overlap: bool = False,
         fused_validation: str = "first-request",
+        attn_tp_group=None,
     ) -> None:
         self.config = config
         self.req_to_token_pool = req_to_token_pool
@@ -130,6 +132,17 @@ class RKVPrefillCompressor:
         # req.output_ids when the next ForwardBatch is built (one-step delay), so
         # the logical decode position must NOT subtract the extra 1.
         self.enable_overlap = enable_overlap
+
+        # Attention-TP group: each rank scores only its LOCAL kv heads, so the
+        # per-token score is summed across this group before top-k to keep the
+        # eviction decision identical on every rank (see _reduce_score_across_tp
+        # / _check_kept_consistent_across_tp). None / world_size==1 => no TP.
+        self.attn_tp_group = attn_tp_group
+        self.attn_tp_size = (
+            getattr(attn_tp_group, "world_size", 1) if attn_tp_group is not None else 1
+        )
+        self._tp_check_always = os.environ.get("SGLANG_RKV_TP_CHECK", "0") == "1"
+        self._tp_check_remaining = 8
 
         self.algo = RKVPrefill(
             budget=config.budget,
@@ -455,11 +468,16 @@ class RKVPrefillCompressor:
     ) -> torch.Tensor:
         """Cross-layer past-token score over ``slots``, batched with a first-call
         A/B gate against the per-layer reference (permanent fallback if the
-        selected past tokens differ, protecting accuracy).
+        selected past tokens differ, protecting accuracy). The score is summed
+        across the attention-TP group so every rank selects the same tokens.
         """
         if self._batched_ok is None:
-            ref = self._reference_scores(slots, window_q_all)
-            bat = self._batched_scores(slots, window_q_all)
+            ref = self._reduce_score_across_tp(
+                self._reference_scores(slots, window_q_all)
+            )
+            bat = self._reduce_score_across_tp(
+                self._batched_scores(slots, window_q_all)
+            )
             num_past = self.config.budget - self.config.window_size
             ok = ref.shape == bat.shape and ref.numel() >= num_past
             if ok:
@@ -476,11 +494,40 @@ class RKVPrefillCompressor:
                 ),
             )
             return bat if self._batched_ok else ref
-        return (
+        return self._reduce_score_across_tp(
             self._batched_scores(slots, window_q_all)
             if self._batched_ok
             else self._reference_scores(slots, window_q_all)
         )
+
+    def _reduce_score_across_tp(self, score: torch.Tensor) -> torch.Tensor:
+        """Sum the per-token score across the attention-TP group (no-op at
+        tp==1). R-KV's cross-head reduction is a linear MEAN over local heads, so
+        with uniform head sharding the all-reduced SUM is a positive scaling of
+        the true global score -> ``topk`` picks the identical tokens on every
+        rank. See ``RKVCompressor._reduce_score_across_tp`` for the full rationale.
+        """
+        if self.attn_tp_group is None or self.attn_tp_size <= 1:
+            return score
+        return self.attn_tp_group.all_reduce(score.float())
+
+    def _check_kept_consistent_across_tp(self, kept: torch.Tensor) -> None:
+        """Assert every attention-TP rank derived the identical kept set (loud
+        failure instead of silent KV divergence). Runs on the first few
+        compactions, or every one when ``SGLANG_RKV_TP_CHECK=1``."""
+        if self.attn_tp_group is None or self.attn_tp_size <= 1:
+            return
+        if not self._tp_check_always:
+            if self._tp_check_remaining <= 0:
+                return
+            self._tp_check_remaining -= 1
+        local = kept.to(torch.float32)
+        summed = self.attn_tp_group.all_reduce(local.clone())
+        if not torch.equal(summed, local * self.attn_tp_size):
+            raise RuntimeError(
+                "R-KV-prefill TP divergence: attention-TP ranks selected "
+                "different kept sets; continuing would corrupt the KV cache."
+            )
 
     # ------------------------------------------------------------------
     # Compaction (after an extend forward)
@@ -495,7 +542,9 @@ class RKVPrefillCompressor:
         if not self._armed:
             return
         r2t = self.req_to_token_pool.req_to_token
-        for req_pool_idx in list(self._armed):
+        # sorted() so every attention-TP rank issues the per-request score
+        # all-reduces in the same order.
+        for req_pool_idx in sorted(self._armed):
             state = self.states.get(req_pool_idx)
             if state is None or state.compressed or state.window_q is None:
                 continue
@@ -503,6 +552,7 @@ class RKVPrefillCompressor:
             slots = r2t[req_pool_idx, :seq_len].long()
             score = self._past_scores(slots, state.window_q)
             kept = self._assemble_kept(score, seq_len)
+            self._check_kept_consistent_across_tp(kept)
             self._compact_request(state, seq_len, kept, latch=True)
         self._armed.clear()
 
@@ -517,7 +567,9 @@ class RKVPrefillCompressor:
         one-shot, so the decode path is identical.
         """
         seq_len_by_req = self._seq_len_by_req(forward_batch)
-        for req_pool_idx, state in list(self.states.items()):
+        # sorted() so every attention-TP rank drives the per-request logical/
+        # physical compactions (and their score all-reduces) in the same order.
+        for req_pool_idx, state in sorted(self.states.items()):
             if state.compressed or state.kept_orig is None:
                 continue
             if state.prompt_len <= self.config.budget:
@@ -528,6 +580,7 @@ class RKVPrefillCompressor:
             # Final forced compaction to budget, against the true final window.
             if state.kept_orig.numel() > self.config.budget:
                 self._logical_compress(req_pool_idx, state)
+            self._check_kept_consistent_across_tp(state.kept_orig)
             self._compact_request(state, seq_len, state.kept_orig, latch=True)
 
     def _assemble_kept(self, score_accum: torch.Tensor, seq_len: int) -> torch.Tensor:
