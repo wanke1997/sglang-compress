@@ -1015,6 +1015,24 @@ class ModelRunnerKVCacheMixin:
                 requested_per_worker,
                 max_num_reqs,
             )
+
+        # R-KV: optionally cap the concurrent decode requests to shrink the fixed
+        # rolling observation-query buffer. Every --enable-rkv request is an R-KV
+        # request, so the decode concurrency IS the rolling_q row count
+        # (rolling_q rows == req_to_token rows == max_running_requests + 1).
+        # Capping here cascades to the req_to_token pool, rolling_q, and the
+        # aux-memory reservation (_reserve_rkv_decode_aux_bytes, which calls this
+        # method for its provisional row count). Trades peak concurrency for
+        # memory.
+        rkv_cap = getattr(self.server_args, "rkv_max_active_requests", None)
+        if self.enable_rkv and rkv_cap is not None and max_num_reqs > rkv_cap:
+            logger.info(
+                "R-KV: capping max_running_requests %d -> %d "
+                "(--rkv-max-active-requests) to shrink the rolling-query buffer.",
+                max_num_reqs,
+                rkv_cap,
+            )
+            max_num_reqs = rkv_cap
         return max_num_reqs
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
@@ -1139,6 +1157,16 @@ class ModelRunnerKVCacheMixin:
             available_bytes / (1 << 30),
             reduced / (1 << 30),
         )
+        if getattr(
+            self.server_args, "rkv_max_active_requests", None
+        ) is None and aux_bytes >= (1 << 30):
+            logger.info(
+                "R-KV: the rolling-query buffer is %.2f GiB (%d concurrent "
+                "requests). Set --rkv-max-active-requests to cap concurrency and "
+                "shrink it ~linearly if you are memory-bound.",
+                aux_bytes / (1 << 30),
+                num_rows - 1,
+            )
         return reduced
 
     def _resolve_memory_pool_config(

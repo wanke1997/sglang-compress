@@ -1886,6 +1886,14 @@ class ServerArgs:
             aliases=["--rkv-extra-config"],
         ),
     ] = None
+    rkv_max_active_requests: A[
+        Optional[int],
+        "R-KV: cap on concurrently-decoding R-KV requests. Caps max_running_requests "
+        "when --enable-rkv, which linearly shrinks the fixed rolling observation-query "
+        "buffer (rolling_q ~ this count x layers x window x heads x head_dim). Trades "
+        "peak decode concurrency for memory; leave unset to keep the auto-resolved "
+        "max_running_requests.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # R-KV prefill (prompt-phase KV compression using R-KV importance+redundancy)
@@ -3003,6 +3011,11 @@ class ServerArgs:
             raise ValueError("--enable-rkv requires --page-size 1 (per-slot free).")
         if self.tp_size > 1:
             raise ValueError("--enable-rkv does not support tensor parallelism yet.")
+        if (
+            self.rkv_max_active_requests is not None
+            and self.rkv_max_active_requests <= 0
+        ):
+            raise ValueError("--rkv-max-active-requests must be a positive integer.")
 
     def _handle_rkv_prefill_validation(self):
         """Enforce the invariants R-KV prefill compression depends on.
