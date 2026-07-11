@@ -611,5 +611,80 @@ class TestRollingQSizeContract(unittest.TestCase):
         self.assertEqual(actual_bytes, formula_bytes)
 
 
+class TestPerRequestCursor(unittest.TestCase):
+    """R3: a per-request write cursor keeps a request's observation window
+    correctly ordered even when it SKIPS decode steps. The old single global
+    cursor advanced on every step regardless of batch membership, so a skipped
+    step left a phantom (unwritten) slot BETWEEN a request's real queries."""
+
+    def _build(self, window=3):
+        device = torch.device("cpu")
+        comp = RKVCompressor(
+            config=RKVConfig(
+                budget=window + 1, window_size=window, buffer_size=window + 1
+            ),
+            req_to_token_pool=MockReqToTokenPool(4, 64, device),
+            token_to_kv_pool=MockKVPool(1, 64, 1, 1, device, torch.float32),
+            kv_allocator=MockAllocator(),
+            start_layer=0,
+            end_layer=1,
+            device=device,
+            q_head_num=1,
+            head_dim=1,
+            q_dtype=torch.float32,
+        )
+        return comp
+
+    @staticmethod
+    def _fb(indices):
+        idx = torch.tensor(indices, dtype=torch.int64)
+        # seq_lens below min_seq_len so nothing arms; only exercise the cursor.
+        sl = torch.ones(len(indices), dtype=torch.int32)
+        return types.SimpleNamespace(req_pool_indices=idx, seq_lens=sl, seq_lens_cpu=sl)
+
+    def _step(self, comp, indices, tags):
+        fb = self._fb(indices)
+        comp.begin_decode_step(fb)
+        q = torch.tensor(tags, dtype=torch.float32).view(-1, 1, 1)
+        comp.collect_decode_query(q, types.SimpleNamespace(layer_id=0), fb)
+
+    def test_skipped_step_keeps_window_order(self):
+        comp = self._build(window=3)
+        A, B = 1, 2
+        comp.on_request_begin(_MockReq(1, 0, req_pool_idx=A))
+        comp.on_request_begin(_MockReq(1, 0, req_pool_idx=B))
+
+        # B participates in steps 1 and 3 but is ABSENT from step 2.
+        self._step(comp, [A, B], [10.0, 100.0])  # qB1 = 100
+        self._step(comp, [A], [11.0])  # B absent (skipped step)
+        self._step(comp, [A, B], [12.0, 200.0])  # qB2 = 200
+
+        wB = comp._read_window_rolling(B)[0, :, 0, 0]  # (window,) temporal order
+        # B's two real queries must be the most recent two, IN ORDER, with the
+        # unwritten slot pushed to the oldest end (not wedged between them).
+        self.assertEqual(wB[-1].item(), 200.0)
+        self.assertEqual(wB[-2].item(), 100.0)
+        # No A query leaked into B's window.
+        self.assertNotIn(11.0, wB.tolist())
+        self.assertNotIn(12.0, wB.tolist())
+
+        # A participated every step: newest-two in order = [11, 12].
+        wA = comp._read_window_rolling(A)[0, :, 0, 0]
+        self.assertEqual(wA[-1].item(), 12.0)
+        self.assertEqual(wA[-2].item(), 11.0)
+
+    def test_reused_slot_resets_cursor(self):
+        comp = self._build(window=3)
+        A = 1
+        comp.on_request_begin(_MockReq(1, 0, req_pool_idx=A))
+        self._step(comp, [A], [1.0])
+        self._step(comp, [A], [2.0])
+        self.assertEqual(int(comp.step_count_of_req[A].item()), 2)
+        # A finishes; a new request reuses the same slot -> counter resets.
+        comp.on_request_end(_MockReq(1, 0, req_pool_idx=A))
+        comp.on_request_begin(_MockReq(1, 0, req_pool_idx=A))
+        self.assertEqual(int(comp.step_count_of_req[A].item()), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -212,11 +212,19 @@ class RKVCompressor:
             self.num_layers, window * max_reqs, q_head_num, head_dim
         )
         self._rolling_max_reqs = max_reqs
-        # This step's circular write slot = global_step % window_size. A fixed-
-        # address GPU scalar; begin_decode_step refreshes it every step (incl.
-        # graph-replay steps), so the captured scatter writes the right slot.
-        self.window_slot = torch.zeros((), device=device, dtype=torch.long)
-        self._global_step = 0
+        # Per-request decode-step counter, keyed by req_pool_idx (a fixed-address
+        # GPU tensor). This step's circular write slot for request ``r`` is
+        # ``step_count_of_req[r] % window_size``. begin_decode_step advances it
+        # for every request in the batch each decode step (incl. graph-replay
+        # steps), and collect_decode_query reads it in-graph. Per-request (not a
+        # single global cursor) so the observation window stays correct even if a
+        # request skips decode steps (future preemption/pipeline/overlap): each
+        # request's slots only advance on the steps it actually participates in.
+        # Row 0 (reserved padding slot) is never a real request, so its counter
+        # stays 0 and padding writes land on rolling_q row 0 harmlessly.
+        self.step_count_of_req = torch.zeros(
+            (max_reqs,), device=device, dtype=torch.long
+        )
 
     # ------------------------------------------------------------------
     # Request lifecycle
@@ -229,6 +237,9 @@ class RKVCompressor:
         state.next_position = len(req.origin_input_ids)
         state.req = req
         self.states[req.req_pool_idx] = state
+        # Reset this slot's step counter so a reused req_pool_idx starts a fresh
+        # observation window (does not inherit the previous request's cursor).
+        self.step_count_of_req[req.req_pool_idx] = 0
 
     def on_request_end(self, req: Req) -> None:
         """Drop a request's R-KV state when it finishes or aborts."""
@@ -298,26 +309,18 @@ class RKVCompressor:
         ``collect_decode_query``, so the window steps no longer force eager --
         they replay the captured decode graph like any other step.
         """
-        # Advance the global circular write slot EVERY decode step (even with no
-        # managed requests) and refresh the fixed-address GPU scalar the captured
-        # rolling_q scatter reads. begin_decode_step runs BEFORE the graph/eager
-        # decision, so this refresh reaches graph-replay steps.
-        #
-        # A single global (batch-synchronous) cursor is correct because every
-        # managed request participates in EVERY decode step between two of its
-        # compactions under the enforced config: overlap scheduling is rejected
-        # (_handle_rkv_validation), continuous batching keeps a running decode
-        # request in every decode batch until it finishes/retracts, and this
-        # counter only advances on decode forwards (prefill batches don't call
-        # begin_decode_step). So the last window_size global slots hold this
-        # request's last window_size queries in order. Reused req_pool_idx slots
-        # (a finished request's row taken by a new one) are safe because
-        # buffer_size >= window_size (asserted in RKVConfig) forces >= window_size
-        # fresh writes before the new request's first compaction. If a future
-        # config lets a managed request skip decode steps (preemption, pipeline,
-        # re-enabled overlap), switch to a per-request GPU cursor here.
-        self._global_step += 1
-        self.window_slot.fill_(self._global_step % self.config.window_size)
+        # Advance the per-request circular write cursor EVERY decode step (even
+        # with no managed requests). Vectorized over the whole batch on the GPU
+        # tensor the captured rolling_q scatter reads; begin_decode_step runs
+        # BEFORE the graph/eager decision, so this advance reaches graph-replay
+        # steps. Per-request (not one global cursor) so each request's window
+        # only advances on the steps it actually participates in — correct even
+        # if a request skips decode steps (future preemption/pipeline/overlap).
+        # Reused req_pool_idx slots are additionally protected by
+        # buffer_size >= window_size (asserted in RKVConfig), which forces
+        # >= window_size fresh writes before the first compaction, and by the
+        # on_request_begin counter reset.
+        self.step_count_of_req[forward_batch.req_pool_indices] += 1
 
         if not self.states:
             return False
@@ -357,7 +360,8 @@ class RKVCompressor:
         """In-graph rolling collection of this layer's decode query.
 
         Writes ``q`` ``(bs, q_head_num, head_dim)`` into the fixed ``rolling_q``
-        buffer at the current global ``window_slot``, indexed by req_pool_idx.
+        buffer at each request's current circular write slot
+        (``step_count_of_req[r] % window_size``), indexed by req_pool_idx.
         Pure-tensor scatter (no host sync / Python loop), so it is captured in
         the decode CUDA graph and runs on graph-replay steps too -- the same
         class of op as ``set_kv_buffer`` scattering into ``token_to_kv_pool`` at
@@ -372,10 +376,13 @@ class RKVCompressor:
         observation window is corrupted.
         """
         layer_idx = layer.layer_id - self.start_layer
-        # Flattened index into (window * max_reqs): slot-major, req-minor.
-        index = (
-            self.window_slot * self._rolling_max_reqs + forward_batch.req_pool_indices
-        )
+        # This step's circular write slot per request = step_count % window.
+        # Read in-graph from the fixed-address per-request counter tensor that
+        # begin_decode_step advanced this step. Flattened index into
+        # (window * max_reqs): slot-major, req-minor.
+        req_indices = forward_batch.req_pool_indices
+        cur = self.step_count_of_req[req_indices] % self.config.window_size
+        index = cur * self._rolling_max_reqs + req_indices
         self._rolling_q_flat[layer_idx].index_copy_(0, index, q)
 
     def _read_window_rolling(self, req_pool_idx: int) -> torch.Tensor:
@@ -386,7 +393,8 @@ class RKVCompressor:
         """
         w = self.rolling_q[:, :, req_pool_idx]  # (num_layers, window, q_heads, hd)
         window = self.config.window_size
-        cur = self._global_step % window  # newest write slot
+        # This request's own newest write slot (per-request cursor).
+        cur = int(self.step_count_of_req[req_pool_idx].item()) % window
         return torch.roll(w, shifts=-(cur + 1), dims=1)
 
     def _layer_score(
@@ -405,9 +413,10 @@ class RKVCompressor:
         # (num_slots, kv_heads, head_dim); gather this request's slots.
         keys = k_buffer[slots].unsqueeze(0).transpose(1, 2).contiguous()
 
-        # queries: (1, q_heads, window_size, head_dim). window_q is filled in
-        # temporal order (slot 0 oldest .. window_size-1 newest) over the eager
-        # window steps that begin_decode_step forced before this compaction.
+        # queries: (1, q_heads, window_size, head_dim). window_q holds the last
+        # window_size decode queries in temporal order (slot 0 oldest ..
+        # window_size-1 newest), read from the in-graph rolling collection
+        # (_read_window_rolling) at compaction time.
         window_q = state.window_q[layer_idx]  # (window, q_heads, head_dim)
         queries = window_q.unsqueeze(0).transpose(1, 2).contiguous()
 
