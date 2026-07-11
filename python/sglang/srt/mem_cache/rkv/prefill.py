@@ -115,7 +115,6 @@ def cal_similarity_tiled(
 
     bsz, kv_heads, seq_len, _ = key_states.shape
     k_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
-    col_idx = torch.arange(seq_len, device=key_states.device)
 
     col_sum = torch.zeros(
         (bsz, kv_heads, seq_len), dtype=torch.float32, device=key_states.device
@@ -129,12 +128,17 @@ def cal_similarity_tiled(
         local = torch.arange(r1 - r0, device=key_states.device)
         sim[:, :, local, r0 + local] = 0.0
 
-        # Per row, find the most-recent (largest-index) neighbour above the
-        # threshold and exempt it (scatter it back to zero), matching the
-        # reference's ``similarity_retain`` for retain_direction="last".
-        mask = sim > threshold
-        idx = torch.where(mask, col_idx.view(1, 1, 1, seq_len), 0)
-        retain = idx.max(dim=-1).values  # (1, kv_heads, B)
+        # Per row, exempt the most-recent (largest-index) above-threshold
+        # neighbour, matching the reference's ``similarity_retain`` for
+        # retain_direction="last". Rather than materialise an int64 ``(B, n)``
+        # index tensor (the dominant temporary here), read the largest True
+        # column straight off the boolean mask: the first True scanning from the
+        # right. Rows with no above-threshold neighbour exempt column 0
+        # (``retain=0``) — exactly the reference's ``where(mask, arange, 0)``.
+        over = sim > threshold
+        has = over.any(dim=-1)
+        last_true = (seq_len - 1) - over.flip(-1).to(torch.uint8).argmax(dim=-1)
+        retain = torch.where(has, last_true, torch.zeros_like(last_true))
         sim.scatter_(-1, retain.unsqueeze(-1), 0.0)
 
         col_sum += sim.to(torch.float32).sum(dim=-2)  # (1, kv_heads, n)
