@@ -83,25 +83,30 @@ flags without `--enable-rkv` (`--disable-radix-cache --disable-overlap-schedule
 After the **batched-scoring** optimization (all layers' R-KV scoring fused into one
 batched `algo._scores` call in `maybe_compact` instead of `num_layers` per-layer
 GEMMs — branch `rkv-batched-compaction`), the full `budget` × `buffer_size` grid was
-re-measured on the same harness (Math-7B, GSM8K 200 items, `--concurrency 32`,
+measured on the same harness (Math-7B, GSM8K 200 items, `--concurrency 32`,
 `max_new_tokens=512`, window=8, decode CUDA graph ON; prompt ≈ 697 tok, peak KV
-≈ 863 tok/req). Full-KV baseline is **2363 tok/s / 92.0%**.
+≈ 863 tok/req), **re-measured 2026-07-11 on the `rkv-fused-redundancy` branch
+across 8 single-GPU servers in parallel** — the grid matches the earlier
+batched-scoring pass within run-to-run noise (expected: at `budget ≤ 512` the
+decode redundancy matrix is only `budget²`, so the fused kernel's headline win
+lands on long-context prefill, not this short-prompt decode workload). Full-KV
+baseline is **2322 tok/s / 92.0%**.
 
 | `budget` | `buffer_size` | Throughput | Accuracy (200) | Compactions | vs pre-opt (main) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1024 | 128 | 2142 | 92.0% | 3 | — |
-| 1024 | 256 | 2223 | 92.0% | 0 | — |
-| 1024 | 512 | 2229 | 91.5% | 0 | — |
-| 512 | 16 | **987** | 90.5% | 1980 | **+81%** (546) |
-| 512 | 128 | **1508** | 91.0% | 149 | +13% (1331) |
-| 512 | 256 | 1951 | 91.5% | 28 | — |
-| 512 | 512 | 2223 | 92.0% | 0 | — |
-| 256 | 16 | **928** | 87.0% | 2216 | **+75%** (530) |
-| 256 | 128 | **1434** | 90.0% | 166 | +7% (1344) |
-| 256 | 256 | 1943 | 91.0% | 29 | — |
-| 256 | 512 | 2219 | 92.0% | 0 | — |
-| 128 | 16 | 986 | 68.0% | 2828 | **+79%** (552) |
-| 128 | 128 | 1542 | 83.0% | 152 | +14% (1352) |
+| 1024 | 128 | 2147 | 92.0% | 3 | — |
+| 1024 | 256 | 2193 | 91.5% | 0 | — |
+| 1024 | 512 | 2196 | 91.5% | 0 | — |
+| 512 | 16 | **942** | 90.5% | 1996 | **+73%** (546) |
+| 512 | 128 | **1430** | 91.0% | 151 | +7% (1331) |
+| 512 | 256 | 1903 | 92.0% | 28 | — |
+| 512 | 512 | 2156 | 92.0% | 0 | — |
+| 256 | 16 | **958** | 89.0% | 2249 | **+81%** (530) |
+| 256 | 128 | **1454** | 90.5% | 159 | +8% (1344) |
+| 256 | 256 | 1920 | 91.5% | 28 | — |
+| 256 | 512 | 2175 | 92.0% | 0 | — |
+| 128 | 16 | 1026 | 70.0% | 2890 | **+86%** (552) |
+| 128 | 128 | 1499 | 83.5% | 154 | +11% (1352) |
 
 ("vs pre-opt" is the batched throughput gain over the pre-optimization number in the
 table above; `buffer_size` 256/512 are new points with no pre-opt reference.)
@@ -110,17 +115,17 @@ table above; `buffer_size` 256/512 are new points with no pre-opt reference.)
 
 1. **The gain scales with compaction frequency (`1/buffer_size`).** Batched scoring
    removes the per-layer scoring cost, which dominates only when compaction is
-   frequent: `buffer_size=16` gains **+75–81%** (541→987 at budget 512), while
-   `buffer_size=128` gains only **+7–14%**. Component profiling confirms the scoring
+   frequent: `buffer_size=16` gains **+73–86%** (546→942 at budget 512), while
+   `buffer_size=128` gains only **+7–11%**. Component profiling confirms the scoring
    GPU time dropped **11.9 s → 1.5 s (−87%)** at budget 512 / buffer 16.
 2. **`buffer_size=16` is no longer a loss-leader.** Pre-opt, budget-512 throughput
-   was 2.5× worse at buffer 16 vs 128 (541 vs 1331); post-opt the gap shrinks to 1.5×
-   (987 vs 1508), so the aggressive / low-peak-memory `buffer_size=16` setting is now
+   was 2.5× worse at buffer 16 vs 128 (546 vs 1331); post-opt the gap shrinks to 1.5×
+   (942 vs 1430), so the aggressive / low-peak-memory `buffer_size=16` setting is now
    practical (the pre-optimization advice was to avoid it — no longer true).
 3. **This workload barely compacts at large `budget`/`buffer_size`.** Compaction
    triggers at `prompt + buffer_size` (≈697 + buffer) and the peak KV is only
-   ~863 tok, so `budget ≥ 1024` **or** `buffer_size ≥ 256` almost never fires (0–29
-   compactions) → throughput ~2150–2230 tok/s = full-KV, accuracy ~92%. Only
+   ~863 tok, so `budget ≥ 1024` **or** `buffer_size ≥ 256` almost never fires (0–28
+   compactions) → throughput ~2150–2200 tok/s = full-KV, accuracy ~92%. Only
    `budget ≤ 512` **and** `buffer_size ≤ 128` genuinely compress on GSM8K. To exercise
    `budget=1024` (or large buffers) use a long-output workload (long-CoT model /
    larger `max_new_tokens`).

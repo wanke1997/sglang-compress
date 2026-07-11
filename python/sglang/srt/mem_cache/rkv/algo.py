@@ -17,6 +17,7 @@ R-KV supports grouped-query attention: ``q_heads`` may be a multiple of
 
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
@@ -24,6 +25,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 __all__ = ["R1KV", "cal_similarity", "compute_attention_scores"]
+
+logger = logging.getLogger(__name__)
+
+# Lazily-loaded fused Triton redundancy kernel (CUDA-only). ``None`` = untried,
+# ``False`` = unavailable (no CUDA / no Triton), else the callable. Adopted per
+# R1KV instance via a one-time smoke check against the full-matrix reference.
+_FUSED_REDUNDANCY = None
+
+
+def _get_fused_redundancy():
+    global _FUSED_REDUNDANCY
+    if _FUSED_REDUNDANCY is None:
+        try:
+            if torch.cuda.is_available():
+                from sglang.srt.mem_cache.rkv.redundancy_fused import (
+                    cal_similarity_fused,
+                )
+
+                _FUSED_REDUNDANCY = cal_similarity_fused
+            else:
+                _FUSED_REDUNDANCY = False
+        except Exception:  # pragma: no cover - triton/build issue -> fallback
+            _FUSED_REDUNDANCY = False
+    return _FUSED_REDUNDANCY
 
 
 def compute_attention_scores(query_states, key_states, pooling="max"):
@@ -135,6 +160,8 @@ class R1KV:
         self.mix_lambda = mix_lambda
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
+        # Fused redundancy backend: None=untried, False=reference fallback, else fn.
+        self._fused_redundancy = None
 
     def _scores(self, key_states, query_states):
         """Compute the per-past-token joint R-KV score.
@@ -161,16 +188,48 @@ class R1KV:
             stride=1,
         )
 
-        similarity_cos = cal_similarity(
-            key_states,
-            retain_ratio=self.retain_ratio,
-            retain_direction=self.retain_direction,
-        )[:, :, : -self.window_size]
+        similarity_cos = self._redundancy(key_states)[:, :, : -self.window_size]
 
         final_score = attn_cache * self.mix_lambda - similarity_cos * (
             1 - self.mix_lambda
         )
         return final_score
+
+    def _reference_redundancy(self, key_states):
+        return cal_similarity(
+            key_states,
+            retain_ratio=self.retain_ratio,
+            retain_direction=self.retain_direction,
+        )
+
+    def _redundancy(self, key_states):
+        """Key-similarity redundancy per past token. On CUDA with
+        ``retain_direction='last'`` this uses the fused Triton kernel, adopted
+        once via a smoke gate against the full-matrix reference (a gross
+        mismatch -> permanent reference fallback, logged). On CPU, without
+        Triton, or for other retain directions it uses ``cal_similarity``.
+        """
+        if self.retain_direction != "last" or not key_states.is_cuda:
+            return self._reference_redundancy(key_states)
+        if self._fused_redundancy is False:
+            return self._reference_redundancy(key_states)
+        if self._fused_redundancy is not None:
+            return self._fused_redundancy(key_states, threshold=0.5)
+        fn = _get_fused_redundancy()
+        if fn is False:
+            self._fused_redundancy = False
+            return self._reference_redundancy(key_states)
+        ref = self._reference_redundancy(key_states)
+        got = fn(key_states, threshold=0.5)
+        ok = ref.shape == got.shape and torch.allclose(
+            ref.float(), got.float(), atol=1e-3, rtol=1e-2
+        )
+        self._fused_redundancy = fn if ok else False
+        logger.info(
+            "R-KV decode fused-redundancy gate: %s",
+            "OK -> fused adopted" if ok else "DIVERGED -> reference fallback",
+        )
+        return got if ok else ref
 
     def select_indices(self, key_states, query_states, sort=True):
         """Return the token indices to keep, per (batch, kv head).
