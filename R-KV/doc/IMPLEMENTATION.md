@@ -62,10 +62,12 @@ past tokens plus the trailing `window` observation tokens.
   the per-request states. Public surface:
   - `on_request_begin(req)` / `on_request_end(req)` — lifecycle.
   - `observe_decode_layer(q, k, v, layer, forward_batch)` — called per layer
-    during decode: caches the query, and (when a compaction is armed) computes
-    and accumulates this layer's per-token score.
+    during decode: caches the query into the observation window. (Scoring is
+    **not** done here; it is batched across all layers in `maybe_compact`.)
   - `maybe_compact(forward_batch)` — called after the full forward pass; for any
-    armed request, assembles the global kept set and physically compacts.
+    armed request, scores all layers in **one batched pass** (with an A/B gate
+    against the per-layer reference), assembles the global kept set, and
+    physically compacts.
   - `override_decode_positions(forward_batch)` — replaces decode positions with
     *logical* positions (see §5).
   - `take_pending_length_updates()` — hands the scheduler the new physical
@@ -86,12 +88,13 @@ FlashInferAttnBackend.init_forward_metadata(fb)   # fb = the REAL decode batch
 
 model.forward → per layer → RadixAttention → FlashInferAttnBackend.forward_decode
   └─ after set_kv_buffer:
-       observe_decode_layer(q, k, v, layer, fb)   # cache query; accumulate score
+       observe_decode_layer(q, k, v, layer, fb)   # cache query into window
                                                    # arm compaction every buffer_size
                                                    # steps once seq_len >= budget
 
 model_runner.forward (after all layers)
-  └─ maybe_compact(fb)                          # for armed reqs: compact
+  └─ maybe_compact(fb)                          # for armed reqs:
+        ├─ score all layers in ONE batched pass (A/B gate vs per-layer ref)
         ├─ assemble kept = top(budget-window) past + trailing window
         └─ _compact_request(...)                # see §6
 ```
@@ -321,10 +324,10 @@ hooks.
 
 ## 12. Other limitations / next
 
-- **O(budget²) similarity** in `cal_similarity` — a phase-2 perf target
-  (chunking / a cheaper redundancy estimate).
-- **No CUDA-graph decode** yet (dynamic eviction can't live in a captured
-  graph). Phase-2 would need a graph-compatible compaction scheme.
+- **O(budget²) similarity** in `cal_similarity` — the per-layer scoring GEMMs are
+  now **batched across layers** (one pass instead of `num_layers`); the per-token
+  O(budget²) redundancy matrix itself is still a phase-2 target (chunking / a
+  cheaper redundancy estimate).
 - **`on_request_end`** is wired at finish, but state is otherwise only cleared
   lazily on `req_pool_idx` reuse — fine for phase 1.
 - Larger-sample accuracy (MATH-500 / AIME-24) and a long-sequence throughput

@@ -43,6 +43,12 @@ a single GPU too), not a DP defect. Physical KV length stayed pinned near `budge
 
 128 items, `concurrency = dp × 16` (≈16 in-flight per replica), `budget=512`.
 
+> **Note (pre-batched-scoring).** The absolute tok/s below predate the
+> **batched-scoring** optimization (each rank is faster on current code — decode
+> +80% at `buffer_size=16`; see [`RESULTS_math7b.md`](./RESULTS_math7b.md)). The
+> point of this table is the **DP scaling ratio** (up to 5.2× on 8 GPUs), which is
+> unaffected by batched scoring since every replica speeds up equally.
+
 | DP | GPUs | Concurrency | Accuracy (128) | avg tok | Wall | Throughput | vs dp=1 | Per-rank |
 | ---: | ---: | ---: | :---: | ---: | ---: | ---: | :---: | ---: |
 | 1 | 1 | 16 | 112/128 (87.5%) | 173 | 57.7s | 385.0 tok/s | 1.00× | 385 |

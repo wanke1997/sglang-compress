@@ -101,13 +101,19 @@ gives ~0% benefit on long prompts anyway (compute-bound).
 ## 3. Optimization roadmap (ROI-ordered)
 
 ### P1 — Optimize R-KV-prefill's O(n²) prefill scoring  ← highest value
-This is now the real bottleneck: it is why R-KV-prefill only ties Full KV at 5k
-(instead of winning), and why its per-request latency is higher (11.2s vs 9.4s
-at 20k). Killing it lets R-KV's *quality* edge (redundancy term) also translate
-into throughput/latency wins.
-- **P1a. Cross-layer subsampling** — score only K of N layers (compute ÷ N/K).
-  Easy, high impact. Validate accuracy A/B (subsampled vs all-layers keep-set
-  Jaccard + judge accuracy) before/after.
+
+> **Update (2026-07-11): partly done.** Per-layer scoring is now **batched across
+> layers** (one `batched_past_score` call instead of `num_layers` GEMMs) for both
+> prefill and decode — 8× on a 2174-token prompt (94.4 ms → 11.9 ms). The items
+> below are the *remaining* work on top of that batched baseline.
+
+This is still a bottleneck: it is why R-KV-prefill only ties Full KV at 5k
+(instead of winning), and why its per-request latency was higher (11.2s vs 9.4s
+at 20k — measured pre-batching; likely narrower now). Killing the rest lets R-KV's
+*quality* edge (redundancy term) also translate into throughput/latency wins.
+- **P1a. Cross-layer subsampling** — on top of the batched pass, score only K of N
+  layers (a further compute ÷ N/K). Easy, high impact. Validate accuracy A/B
+  (subsampled vs all-layers keep-set Jaccard + judge accuracy) before/after.
 - **P1b. Redundancy-term approximation** — the `k_norm @ k_norm.T` is the O(n²)
   cost. Try local-window / blocked similarity or clustering instead of full
   pairwise. Bounds compute to O(n·w).
@@ -149,9 +155,11 @@ it needs expensive large-scale race re-validation.
 - Consider an adaptive `new_token_ratio` for compressed requests.
 
 ### P6 — Decode R-KV throughput (different use case)
-Adaptive compaction frequency, cross-layer score sampling, relocate on a
-separate CUDA stream, put scoring into the graph. These target the *decode*
-R-KV (short prompt / long CoT output), not the summarization workload.
+Cross-layer score **batching is done** (+80% throughput at `buffer_size=16`).
+Remaining: adaptive compaction frequency, cross-layer score *subsampling*,
+relocate on a separate CUDA stream, and letting the forced-eager window steps
+replay the graph. These target the *decode* R-KV (short prompt / long CoT
+output), not the summarization workload.
 
 ### P7 — Quality robustness
 n=136 single judge pass is noisy (~±2 rows). Multi-seed judging or a larger

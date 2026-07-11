@@ -71,6 +71,13 @@ large enough. Crucially, the server ran **hundreds of physical compactions
 computes an O(budget²) key-similarity, and relocates slots — all synchronous on
 the eager path.
 
+> **Note (pre-batched-scoring).** These 0.5B numbers predate the **batched-scoring**
+> optimization, which fused the per-layer scoring GEMMs and cut that cost sharply
+> (on Math-7B: scoring GPU time 11.9 s → 1.5 s, decode throughput **+80%** at
+> `buffer_size=16`). The ~26% figure here is the *old* per-layer-scoring overhead;
+> on current code it is much smaller. See the current sweep in
+> [`RESULTS_math7b.md`](./RESULTS_math7b.md).
+
 **Loss of CUDA graph (historical — no longer required).** These 0.5B numbers are
 the earlier **eager-vs-eager** measurement, when R-KV ran eager. **Decode CUDA
 graph is now supported** via the hybrid eager/graph path, so R-KV no longer gives

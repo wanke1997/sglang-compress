@@ -140,8 +140,9 @@ File paths are relative to the repo root.
    process, so `Req` length fields are updated in place; the batch `seq_lens`
    tensor is updated from `RKVCompressor.take_pending_length_updates()`.
 5. **O(budget²) similarity** — `cal_similarity` builds a `budget × budget`
-   matrix per layer per trigger. Fine for correctness; a target for phase-2
-   optimization (chunking / cheaper redundancy estimate).
+   matrix per layer per trigger. The per-layer scoring is now **batched across
+   layers** (one pass instead of `num_layers` GEMMs); the O(budget²) matrix
+   itself is still a phase-2 target (chunking / cheaper redundancy estimate).
 
 ## 8. `sparsity/` framework — evaluated, not reused (2026-07)
 
@@ -221,7 +222,12 @@ adaptor), the lifecycle hook names (`on_request_begin/end`,
   Plain data parallelism (`--dp-size N --tp-size 1`) is also validated — each
   rank runs its own R-KV; throughput scales up to 5.2× on 8× H100 (see
   benchmark/RESULTS_dp.md). TP and dp-attention remain unsupported/untested.
-- **[LATER] Phase 2** — performance: avoid redundant read-back, optimize the
-  O(budget²) similarity, CUDA-graph compatibility, reduce host/device syncs, and
-  **TP ≥ 2 support** (cross-rank all-reduce of per-token scores; see
-  IMPLEMENTATION.md §11.2). Then larger-sample accuracy on MATH-500 / AIME-24.
+- **[DONE] Phase 2 (partial)** — **decode CUDA-graph compatibility** (hybrid
+  eager/graph path) and **batched cross-layer scoring** (one pass instead of
+  `num_layers` GEMMs; +80% decode throughput at `buffer_size=16`, and 8× prefill
+  scoring on a 2174-token prompt) are shipped.
+- **[LATER] Phase 2 (remaining)** — performance: optimize the O(budget²)
+  redundancy matrix, reduce host/device syncs, let the forced-eager window steps
+  replay the graph, and **TP ≥ 2 support** (cross-rank all-reduce of per-token
+  scores; see IMPLEMENTATION.md §11.2). Then larger-sample accuracy on
+  MATH-500 / AIME-24.
