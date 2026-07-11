@@ -149,5 +149,73 @@ class TestFusedRedundancyRetain(unittest.TestCase):
         self.assertTrue(torch.allclose(ref, got, atol=5e-4, rtol=1e-3))
 
 
+@unittest.skipUnless(
+    _HAS_CUDA and _HAS_TRITON, "fused redundancy kernel needs CUDA + Triton"
+)
+class TestDecodeR1KVFused(unittest.TestCase):
+    """Decode R1KV._scores must be unchanged when the fused kernel is adopted."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.R1KV = _load("rkv_algo", "algo.py").R1KV
+
+    def _pair(self, budget=64, window=8):
+        kw = dict(
+            budget=budget,
+            window_size=window,
+            kernel_size=7,
+            mix_lambda=0.1,
+            retain_ratio=0.1,
+            retain_direction="last",
+        )
+        fused = self.R1KV(**kw)
+        ref = self.R1KV(**kw)
+        ref._fused_redundancy = False  # force full-matrix cal_similarity
+        return fused, ref
+
+    def test_scores_parity_fp32(self):
+        for n in (128, 512, 1500):
+            torch.manual_seed(n)
+            k = torch.randn(2, 4, n, 128, device="cuda", dtype=torch.float32)
+            q = torch.randn(2, 4, n, 128, device="cuda", dtype=torch.float32)
+            fused, ref = self._pair()
+            sf = fused._scores(k, q)
+            sr = ref._scores(k, q)
+            self.assertTrue(
+                torch.allclose(sf, sr, atol=5e-4, rtol=1e-3),
+                f"decode _scores diverged n={n}: max {(sf - sr).abs().max().item():.3e}",
+            )
+
+    def test_select_indices_parity_fp32(self):
+        # fp32 fused is bit-exact -> identical kept-token selection (incl. GQA).
+        for n in (200, 512, 1500):
+            torch.manual_seed(n + 1)
+            k = torch.randn(1, 4, n, 128, device="cuda", dtype=torch.float32)
+            q = torch.randn(1, 8, n, 128, device="cuda", dtype=torch.float32)
+            fused, ref = self._pair()
+            idx_f = fused.select_indices(k, q, sort=True)
+            idx_r = ref.select_indices(k, q, sort=True)
+            self.assertTrue(
+                torch.equal(idx_f, idx_r), f"decode select_indices differ at n={n}"
+            )
+
+    def test_gate_adopts_fused(self):
+        torch.manual_seed(3)
+        k = torch.randn(2, 4, 300, 128, device="cuda", dtype=torch.float32)
+        q = torch.randn(2, 4, 300, 128, device="cuda", dtype=torch.float32)
+        algo = self.R1KV(
+            budget=64,
+            window_size=8,
+            kernel_size=7,
+            mix_lambda=0.1,
+            retain_ratio=0.1,
+            retain_direction="last",
+        )
+        self.assertIsNone(algo._fused_redundancy)
+        algo._scores(k, q)  # first call runs the smoke gate
+        self.assertIsNotNone(algo._fused_redundancy)
+        self.assertIsNot(algo._fused_redundancy, False)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
