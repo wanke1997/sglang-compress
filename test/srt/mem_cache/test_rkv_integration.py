@@ -387,11 +387,20 @@ class TestBatchObserve(unittest.TestCase):
         )
         self.assertEqual(self.comp.states[self.short_idx].steps_since_compact, 0)
 
-        # Armed request accumulated a per-past-token score of the right shape.
-        accum = self.comp.states[self.long_idx].score_accum
-        self.assertIsNotNone(accum)
-        self.assertEqual(accum.shape, (self.long_len - self.window,))
-        self.assertIsNone(self.comp.states[self.short_idx].score_accum)
+        # observe's new job is only to capture window queries; scoring moved to
+        # maybe_compact. The armed (long) request has a filled window; the short
+        # request never armed so its window was never allocated.
+        long_state = self.comp.states[self.long_idx]
+        self.assertIsNotNone(long_state.window_q)
+        self.assertIsNone(self.comp.states[self.short_idx].window_q)
+
+        # Batched scoring produces the right shape and matches the per-layer
+        # reference (the invariant the A/B gate relies on).
+        ref = self.comp._reference_scores(long_state, self.long_len)
+        bat = self.comp._batched_scores(long_state, self.long_len)
+        self.assertEqual(ref.shape, (self.long_len - self.window,))
+        self.assertEqual(bat.shape, (self.long_len - self.window,))
+        self.assertTrue(torch.allclose(ref, bat, atol=1e-4))
 
     def test_eager_gating_schedule(self):
         # begin_decode_step must force EAGER only on the window_size steps ending

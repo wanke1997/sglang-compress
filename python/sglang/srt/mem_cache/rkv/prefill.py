@@ -113,12 +113,12 @@ def cal_similarity_tiled(
             key_states, threshold=threshold, retain_direction=retain_direction
         )
 
-    _, kv_heads, seq_len, _ = key_states.shape
+    bsz, kv_heads, seq_len, _ = key_states.shape
     k_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
     col_idx = torch.arange(seq_len, device=key_states.device)
 
     col_sum = torch.zeros(
-        (1, kv_heads, seq_len), dtype=torch.float32, device=key_states.device
+        (bsz, kv_heads, seq_len), dtype=torch.float32, device=key_states.device
     )
     for r0 in range(0, seq_len, row_block):
         r1 = min(r0 + row_block, seq_len)
@@ -228,6 +228,24 @@ class RKVPrefill:
         redundancy = self._redundancy_past(keys)  # (1, kv_heads, n-w)
         final = importance * self.mix_lambda - redundancy * (1 - self.mix_lambda)
         return final.mean(dim=1).squeeze(0)  # (n - window,)
+
+    def batched_past_score(
+        self, keys: torch.Tensor, window_q: torch.Tensor
+    ) -> torch.Tensor:
+        """Batched :meth:`layer_past_score` over a leading batch dim (e.g. layers).
+
+        ``keys``: ``(B, kv_heads, n, d)``; ``window_q``: ``(B, q_heads, w, d)``.
+        Returns ``(B, n - window_size)`` — the same head-mean joint score as
+        ``layer_past_score`` but without the bsz=1 ``squeeze``, so the whole
+        stack of layers is scored in one batched pass instead of a Python loop.
+        The redundancy term (``cal_similarity_tiled``) and importance term
+        (``_attention_logits``) both already carry the batch dim, so this is a
+        pure batching of the existing per-layer math.
+        """
+        importance = self._importance_past(keys, window_q)  # (B, kv_heads, n-w)
+        redundancy = self._redundancy_past(keys)  # (B, kv_heads, n-w)
+        final = importance * self.mix_lambda - redundancy * (1 - self.mix_lambda)
+        return final.mean(dim=1)  # (B, n - window)
 
     def _select_from_score(
         self, score_past: torch.Tensor, seq_len: int

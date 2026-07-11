@@ -47,21 +47,22 @@ This directory's docs and benchmark below focus on the **decode-time** mode; the
 
 ## Headline result — decode mode, Qwen2.5-Math-7B-Instruct (single NVIDIA H100)
 
-GSM8K (200 questions, 5-shot, `max_new_tokens=512`), **decode CUDA graph ON**,
-`budget=512, window=8, buffer=16`:
+GSM8K (200 questions, `max_new_tokens=512`, `--concurrency 32`), **decode CUDA
+graph ON**, **batched scoring**, `budget=512, window=8, buffer=16`:
 
-| Config | Accuracy (200) | Total time | Throughput | Compactions |
-| --- | --- | --- | --- | --- |
-| Full-KV baseline | 90.0% | 12.1 s | 1817 tok/s | — |
-| **R-KV decode** | **91.5%** | 43.0 s | 510 tok/s | 1263 |
+| Config | Accuracy (200) | Throughput | Compactions |
+| --- | --- | --- | --- |
+| Full-KV baseline | 92.0% | 2363 tok/s | — |
+| **R-KV decode (batched)** | **90.5%** | 987 tok/s | 1980 |
 
-Accuracy is **lossless** (91.5% vs 90.0%, within n=200 judge noise) and R-KV runs
-**with CUDA graph** (1263 physical compactions, zero crashes) — confirming the
-hybrid eager/graph decode path is correct. The **3.5× throughput cost here is the
-worst case**: GSM8K has short outputs and no memory pressure, so R-KV is pure
-overhead with no memory payoff to recoup. R-KV wins on throughput only when the
-server is memory-bound with long decodes. Full analysis (and the earlier
-eager-path numbers): [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md).
+Accuracy is **lossless** (90.5% vs 92.0%, within n=200 judge noise) and R-KV runs
+**with CUDA graph** (1980 physical compactions, zero crashes) — the hybrid
+eager/graph decode path is correct. Throughput here is a **~2.4× cost**, down from
+~4.4× before **batched scoring** (which fused the per-layer scoring GEMMs for
+**+80%**, 546→987 tok/s): GSM8K has short outputs and no memory pressure, so R-KV is
+pure overhead with no memory payoff to recoup. R-KV wins on throughput only when the
+server is memory-bound with long decodes. Full sweep + before/after:
+[`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md).
 
 ---
 

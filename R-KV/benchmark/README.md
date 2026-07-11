@@ -114,17 +114,23 @@ server log at `budget=512, buffer_size=16`. The `window_size` steps ending at ea
 compaction run eager (they collect the scoring queries); constraint:
 `buffer_size >= window_size`.
 
-**Choosing values** (Qwen2.5-Math-7B, GSM8K, ~700-token prompt; full sweep in
+**Choosing values** (Qwen2.5-Math-7B, GSM8K, ~700-token prompt; throughput below is
+the current **batched-scoring** path — full grid + pre-optimization comparison in
 [`RESULTS_math7b.md`](./RESULTS_math7b.md)):
 
-- **Throughput ← `buffer_size`** (not budget): `BUFFER=16` ≈ 540 tok/s vs
-  `BUFFER=128` ≈ 1340 tok/s (2.5×), roughly independent of budget. Use
-  `BUFFER>=128`; `BUFFER=16` halves throughput for almost no extra memory saving.
+- **Throughput ← `buffer_size`** (not budget): at budget 512, `BUFFER=16` ≈ 990 tok/s
+  vs `BUFFER=128` ≈ 1510 tok/s — a **1.5× gap** (was 2.5× before batched scoring, which
+  cut the per-compaction cost). Larger `buffer_size` is still faster, but small buffers
+  are now practical rather than a loss-leader.
 - **Accuracy / memory ← `budget`**: `budget=512` is lossless (−41% KV),
   `budget=256` near-lossless (90% vs 92%, −70% KV), `budget=128` collapses. For
   this prompt length `budget=256` is the lossless wall.
-- **Sweet spot:** `BUFFER=128 ./launch_server.sh rkv 256` — near-lossless, ~57% of
-  baseline throughput, ~70% less KV per request.
+- **Sweet spot:** `BUFFER=128 ./launch_server.sh rkv 256` — near-lossless (90%), ~61%
+  of baseline throughput, ~70% less KV per request. For the most timely memory reclaim
+  (lower peak KV), `BUFFER=16` is now viable too (~40% of baseline).
+- **Note:** on this short-output GSM8K workload, `budget ≥ 1024` or `buffer_size ≥ 256`
+  barely compacts (peak KV ≈863 < trigger `prompt + buffer`), so those settings fall
+  back to full-KV throughput/accuracy; use a long-output workload to exercise them.
 
 ```bash
 BUFFER=128 ./launch_server.sh rkv 256   # sweet spot: budget=256, buffer_size=128

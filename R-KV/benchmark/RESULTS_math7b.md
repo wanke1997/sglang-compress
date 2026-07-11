@@ -4,17 +4,22 @@ Dedicated report for the R-KV port on a **strong math model**, where accuracy
 differences are signal rather than noise. Companion to [`RESULTS.md`](./RESULTS.md)
 (which also covers the weak Qwen2.5-0.5B sanity check).
 
-Two campaigns:
-- **§A — GSM8K with decode CUDA graph ON (2026-07-10, current).** n=200, the
-  standard [`benchmark/gsm8k/bench_sglang.py`](../../benchmark/gsm8k/bench_sglang.py)
-  harness, decode CUDA graph enabled — the production-relevant run.
-- **§B — phase-1 eager-path sweep (historical).** The original n=20 correctness
-  sweep on the eager decode path (predates CUDA-graph support), kept for
-  reference.
+Contents:
+- **Current results — batched-scoring sweep.** The canonical `budget` × `buffer_size`
+  throughput/accuracy grid on the **current** code (decode batched scoring). **Use
+  these numbers.**
+- **Historical (pre-optimization).** §A (a `bench_sglang.py` CUDA-graph headline) and
+  §B (the phase-1 eager n=20 sweep) predate batched scoring; kept for the CUDA-graph
+  validation and the correctness sweep, **not** for current throughput.
 
 ---
 
-## A. GSM8K with decode CUDA graph ON (current)
+## A. GSM8K with decode CUDA graph ON (historical, pre-optimization)
+
+> **Superseded for throughput by the current batched-scoring sweep below** — this §A
+> ran on the pre-batched per-layer-scoring code. Kept because it validates decode
+> CUDA-graph compatibility on the `bench_sglang.py` harness; do **not** read its
+> tok/s as current.
 
 **Setup.** `Qwen2.5-Math-7B-Instruct`, single H100 (`--mem-fraction-static 0.85`),
 GSM8K test set, **200 questions**, 5-shot, `max_new_tokens=512`, `temperature=0`,
@@ -47,60 +52,82 @@ flags without `--enable-rkv` (`--disable-radix-cache --disable-overlap-schedule
    steps. In the CUDA-graph regime the **baseline speeds up far more than R-KV**
    (full ~101→1817 tok/s vs R-KV ~74→510 across the eager→graph move), so the
    *relative* gap widens beyond the old eager-vs-eager ~28%.
-4. **Two knobs shrink it:** a larger `buffer_size` (rarer compactions → fewer
-   forced-eager steps) and cross-layer score subsampling (the O(budget²) scoring
-   dominates). And the *benefit* side (memory-bound, long CoT) is not exercised
+4. **What shrinks it:** a larger `buffer_size` (rarer compactions → fewer
+   forced-eager steps). The per-layer scoring cost this §A blamed has since been
+   **removed by batched scoring** (see the current sweep below: scoring GPU time
+   11.9 s → 1.5 s); the remaining overhead is the forced-eager window/compaction
+   steps. The *benefit* side (memory-bound, long CoT) is not exercised
    here at all — see the §B caveat.
 
 ---
 
-## Tuning sweep: `budget` × `buffer_size` (2026-07-10, decode CUDA graph ON)
+## Tuning: `budget` × `buffer_size` (superseded — see current sweep below)
 
-**Setup.** `Qwen2.5-Math-7B-Instruct`, single H100 (`--mem-fraction-static 0.85`),
-GSM8K **200 questions**, `--concurrency 32`, `max_new_tokens=512`, `temperature=0`,
-`window_size=8`, decode CUDA graph ON. Prompt ≈ **697 tokens** (measured, min 663 /
-max 765) + ~166 output → **full-KV footprint ≈ 863 tokens/request**. Baseline is the
-same flags without `--enable-rkv`.
+> The original **pre-optimization** sweep (per-layer scoring: 541/1331 tok/s at
+> budget 512, 530/1344 at 256, 552/1352 at 128) is folded into the **"vs pre-opt"**
+> column of the current batched-scoring sweep below, so this file shows **one**
+> current table instead of two. The qualitative rules are unchanged: **`buffer_size`
+> sets throughput, `budget` sets accuracy/memory, and `budget=256` is the lossless
+> wall.**
 
-| `budget` | `buffer_size` | Accuracy (200) | avg tok | Throughput | Compactions | Steady KV saving | Concurrency ceiling |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| full-KV | — | **92.0%** | 166 | **2363 tok/s** | 0 | 0% | 1.0× |
-| 512 | 128 | **91.5%** | 165 | 1331 | 149 | 41% | 1.7× |
-| 512 | 16 | 90.5% | 167 | 541 | 1980 | 41% | 1.7× |
-| 256 | 128 | **90.0%** | 180 | 1344 | 166 | **70%** | **3.4×** |
-| 256 | 16 | 88.5% | 186 | 530 | 2216 | 70% | 3.4× |
-| 128 | 128 | 83.0% | 165 | 1352 | 152 | 85% | 6.7× |
-| 128 | 16 | 68.5% | 236 | 552 | 2828 | 85% | 6.7× |
+> **Caveat — not memory-bound.** At `--concurrency 32` with ~860-token sequences the
+> KV pool (~981k tokens) is far from full, so the "KV saving" column below is a
+> *footprint / concurrency ceiling*, not a realised throughput gain. To turn it into
+> aggregate throughput you need a memory-bound setting (small pool, long sequences,
+> or high concurrency) where full-KV queues/OOMs and R-KV does not.
 
-(Steady KV saving `= 1 − budget/863`; concurrency ceiling `= 863/budget` — how many
-× more requests the same KV pool holds when memory-bound.)
+---
 
-**The two knobs are orthogonal.**
+## Current results: `budget` × `buffer_size` (batched scoring, 2026-07-11)
 
-1. **Throughput is set by `buffer_size`, not `budget`.** `buffer_size=16` gives
-   ~540 tok/s and `buffer_size=128` gives ~1340 tok/s (2.5×) at *every* budget,
-   because compaction frequency = `output_len / buffer_size` and the cost is
-   dominated by the forced-eager window/compaction steps, not the scoring
-   arithmetic. Confirmed by the extremes: `buffer_size=512` → **0 compactions** →
-   2213 tok/s = 94% of baseline (so R-KV's per-step fixed cost is only ~6%), while a
-   full-eager `buffer_size=16` run gives 555 tok/s ≈ the hybrid-graph 541 — at high
-   compaction frequency the CUDA graph barely helps.
-2. **Accuracy and memory are set by `budget`.** `budget=512` is lossless (−41% KV),
-   `budget=256` near-lossless (90.0% vs 92.0%, −70% KV), `budget=128` collapses
-   (68–83%, with runaway generation — avg_tok 236). For this ~700-token prompt,
-   **`budget=256` is the lossless wall.**
+After the **batched-scoring** optimization (all layers' R-KV scoring fused into one
+batched `algo._scores` call in `maybe_compact` instead of `num_layers` per-layer
+GEMMs — branch `rkv-batched-compaction`), the full `budget` × `buffer_size` grid was
+re-measured on the same harness (Math-7B, GSM8K 200 items, `--concurrency 32`,
+`max_new_tokens=512`, window=8, decode CUDA graph ON; prompt ≈ 697 tok, peak KV
+≈ 863 tok/req). Full-KV baseline is **2363 tok/s / 92.0%**.
 
-**Sweet spot: `budget=256, buffer_size=128`** — near-lossless (90.0%), ~57% of
-baseline throughput, ~70% less KV per request (≈3.4× concurrency ceiling).
-`budget=512, buffer_size=128` is the conservative fully-lossless choice (−41% KV).
-Avoid `buffer_size=16` (halves throughput for almost no extra saving) and
-`budget=128` (past the accuracy wall).
+| `budget` | `buffer_size` | Throughput | Accuracy (200) | Compactions | vs pre-opt (main) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 128 | 2142 | 92.0% | 3 | — |
+| 1024 | 256 | 2223 | 92.0% | 0 | — |
+| 1024 | 512 | 2229 | 91.5% | 0 | — |
+| 512 | 16 | **987** | 90.5% | 1980 | **+81%** (546) |
+| 512 | 128 | **1508** | 91.0% | 149 | +13% (1331) |
+| 512 | 256 | 1951 | 91.5% | 28 | — |
+| 512 | 512 | 2223 | 92.0% | 0 | — |
+| 256 | 16 | **928** | 87.0% | 2216 | **+75%** (530) |
+| 256 | 128 | **1434** | 90.0% | 166 | +7% (1344) |
+| 256 | 256 | 1943 | 91.0% | 29 | — |
+| 256 | 512 | 2219 | 92.0% | 0 | — |
+| 128 | 16 | 986 | 68.0% | 2828 | **+79%** (552) |
+| 128 | 128 | 1542 | 83.0% | 152 | +14% (1352) |
 
-> **Caveat — this run is not memory-bound.** At `--concurrency 32` with ~860-token
-> sequences the KV pool (~981k tokens) is far from full, so the "KV saving" column
-> is a *footprint / concurrency ceiling*, not a realised throughput gain. To turn
-> the saving into aggregate throughput you need a memory-bound setting (small pool,
-> long sequences, or high concurrency) where full-KV queues/OOMs and R-KV does not.
+("vs pre-opt" is the batched throughput gain over the pre-optimization number in the
+table above; `buffer_size` 256/512 are new points with no pre-opt reference.)
+
+**Findings.**
+
+1. **The gain scales with compaction frequency (`1/buffer_size`).** Batched scoring
+   removes the per-layer scoring cost, which dominates only when compaction is
+   frequent: `buffer_size=16` gains **+75–81%** (541→987 at budget 512), while
+   `buffer_size=128` gains only **+7–14%**. Component profiling confirms the scoring
+   GPU time dropped **11.9 s → 1.5 s (−87%)** at budget 512 / buffer 16.
+2. **`buffer_size=16` is no longer a loss-leader.** Pre-opt, budget-512 throughput
+   was 2.5× worse at buffer 16 vs 128 (541 vs 1331); post-opt the gap shrinks to 1.5×
+   (987 vs 1508), so the aggressive / low-peak-memory `buffer_size=16` setting is now
+   practical (the pre-optimization advice was to avoid it — no longer true).
+3. **This workload barely compacts at large `budget`/`buffer_size`.** Compaction
+   triggers at `prompt + buffer_size` (≈697 + buffer) and the peak KV is only
+   ~863 tok, so `budget ≥ 1024` **or** `buffer_size ≥ 256` almost never fires (0–29
+   compactions) → throughput ~2150–2230 tok/s = full-KV, accuracy ~92%. Only
+   `budget ≤ 512` **and** `buffer_size ≤ 128` genuinely compress on GSM8K. To exercise
+   `budget=1024` (or large buffers) use a long-output workload (long-CoT model /
+   larger `max_new_tokens`).
+4. **Accuracy is preserved.** Every point's first-compaction A/B gate logged
+   `kept diff=0` (batched selection identical to the per-layer reference); the
+   ≤1.5-point wobble vs pre-opt is run-to-run concurrency-scheduling noise, not a
+   systematic change.
 
 ---
 
@@ -183,7 +210,7 @@ still needed to show the upside.
 
 ## Reproduce
 
-**§A — GSM8K with CUDA graph (current):**
+**§A — GSM8K with CUDA graph (historical headline, `bench_sglang.py` harness):**
 
 ```bash
 # R-KV decode (CUDA graph ON):
