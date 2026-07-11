@@ -5,9 +5,9 @@ differences are signal rather than noise. Companion to [`RESULTS.md`](./RESULTS.
 (which also covers the weak Qwen2.5-0.5B sanity check).
 
 Contents:
-- **Current results — batched-scoring sweep.** The canonical `budget` × `buffer_size`
-  throughput/accuracy grid on the **current** code (decode batched scoring). **Use
-  these numbers.**
+- **Current results — decode-graph sweep.** The canonical `budget` × `buffer_size`
+  throughput/accuracy grid on the **current** code (in-graph decode query collection
+  + batched scoring). **Use these numbers.**
 - **Historical (pre-optimization).** §A (a `bench_sglang.py` CUDA-graph headline) and
   §B (the phase-1 eager n=20 sweep) predate batched scoring; kept for the CUDA-graph
   validation and the correctness sweep, **not** for current throughput.
@@ -63,12 +63,12 @@ flags without `--enable-rkv` (`--disable-radix-cache --disable-overlap-schedule
 
 ## Tuning: `budget` × `buffer_size` (superseded — see current sweep below)
 
-> The original **pre-optimization** sweep (per-layer scoring: 541/1331 tok/s at
-> budget 512, 530/1344 at 256, 552/1352 at 128) is folded into the **"vs pre-opt"**
-> column of the current batched-scoring sweep below, so this file shows **one**
-> current table instead of two. The qualitative rules are unchanged: **`buffer_size`
-> sets throughput, `budget` sets accuracy/memory, and `budget=256` is the lossless
-> wall.**
+> The original **pre-optimization** sweep (per-layer eager scoring: 541/1331 tok/s at
+> budget 512, 530/1344 at 256, 552/1352 at 128) is superseded by the current sweep
+> below (in-graph decode collection + batched scoring), which is **~2.4×** faster at
+> the frequently-compacting `buffer_size=16` points. The qualitative rules are
+> unchanged: **`buffer_size` sets throughput, `budget` sets accuracy/memory, and
+> `budget=256` is the lossless wall.**
 
 > **Caveat — not memory-bound.** At `--concurrency 32` with ~860-token sequences the
 > KV pool (~981k tokens) is far from full, so the "KV saving" column below is a
@@ -78,61 +78,66 @@ flags without `--enable-rkv` (`--disable-radix-cache --disable-overlap-schedule
 
 ---
 
-## Current results: `budget` × `buffer_size` (batched scoring, 2026-07-11)
+## Current results: `budget` × `buffer_size` (in-graph decode collection, 2026-07-11)
 
-After the **batched-scoring** optimization (all layers' R-KV scoring fused into one
-batched `algo._scores` call in `maybe_compact` instead of `num_layers` per-layer
-GEMMs — branch `rkv-batched-compaction`), the full `budget` × `buffer_size` grid was
-measured on the same harness (Math-7B, GSM8K 200 items, `--concurrency 32`,
-`max_new_tokens=512`, window=8, decode CUDA graph ON; prompt ≈ 697 tok, peak KV
-≈ 863 tok/req), **re-measured 2026-07-11 on the `rkv-fused-redundancy` branch
-across 8 single-GPU servers in parallel** — the grid matches the earlier
-batched-scoring pass within run-to-run noise (expected: at `budget ≤ 512` the
-decode redundancy matrix is only `budget²`, so the fused kernel's headline win
-lands on long-context prefill, not this short-prompt decode workload). Full-KV
-baseline is **2322 tok/s / 92.0%**.
+On the **current** code the `window_size` observation-window queries are scattered
+into a fixed rolling buffer *inside* the captured decode CUDA graph
+(`collect_decode_query`), so only the compaction step itself still runs eager —
+every other decode step, including the window steps, replays the graph (branch
+`rkv-decode-graph-query`, stacked on the earlier batched scoring). The full
+`budget` × `buffer_size` grid was **re-measured 2026-07-11 across 8 single-GPU
+H100 servers in parallel** on the same harness (Math-7B, GSM8K 200 items,
+`--concurrency 32`, `max_new_tokens=512`, window=8, decode CUDA graph ON; prompt
+≈ 697 tok, peak KV ≈ 863 tok/req). Full-KV baseline is **2320 tok/s / 92.0%**.
 
-| `budget` | `buffer_size` | Throughput | Accuracy (200) | Compactions | vs pre-opt (main) |
+| `budget` | `buffer_size` | Throughput | Accuracy (200) | Compactions | vs pre-P3 (batched) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1024 | 128 | 2147 | 92.0% | 3 | — |
-| 1024 | 256 | 2193 | 91.5% | 0 | — |
-| 1024 | 512 | 2196 | 91.5% | 0 | — |
-| 512 | 16 | **942** | 90.5% | 1996 | **+73%** (546) |
-| 512 | 128 | **1430** | 91.0% | 151 | +7% (1331) |
-| 512 | 256 | 1903 | 92.0% | 28 | — |
-| 512 | 512 | 2156 | 92.0% | 0 | — |
-| 256 | 16 | **958** | 89.0% | 2249 | **+81%** (530) |
-| 256 | 128 | **1454** | 90.5% | 159 | +8% (1344) |
-| 256 | 256 | 1920 | 91.5% | 28 | — |
-| 256 | 512 | 2175 | 92.0% | 0 | — |
-| 128 | 16 | 1026 | 70.0% | 2890 | **+86%** (552) |
-| 128 | 128 | 1499 | 83.5% | 154 | +11% (1352) |
+| 1024 | 128 | 2117 | 92.0% | 3 | — |
+| 1024 | 256 | 2157 | 92.0% | 0 | — |
+| 1024 | 512 | 2145 | 91.5% | 0 | — |
+| 512 | 16 | **1330** | 90.5% | 1981 | **+41%** (942) |
+| 512 | 128 | **1966** | 91.5% | 151 | **+37%** (1430) |
+| 512 | 256 | 2099 | 92.0% | 28 | +10% (1903) |
+| 512 | 512 | 2152 | 92.0% | 0 | — (2156) |
+| 256 | 16 | **1283** | 87.0% | 2281 | **+34%** (958) |
+| 256 | 128 | **1924** | 90.5% | 165 | **+32%** (1454) |
+| 256 | 256 | 2089 | 91.0% | 28 | +9% (1920) |
+| 256 | 512 | 2139 | 92.0% | 0 | — (2175) |
+| 128 | 16 | 1419 | 69.0% | 2917 | **+38%** (1026) |
+| 128 | 128 | 2040 | 84.0% | 153 | **+36%** (1499) |
 
-("vs pre-opt" is the batched throughput gain over the pre-optimization number in the
-table above; `buffer_size` 256/512 are new points with no pre-opt reference.)
+("vs pre-P3" is the throughput gain over the pre-P3 batched-scoring number in
+parentheses — same code but the `window_size` window steps still forced eager;
+`buffer_size ≥ 256` barely compacts so its delta is within run-to-run noise.)
 
 **Findings.**
 
-1. **The gain scales with compaction frequency (`1/buffer_size`).** Batched scoring
-   removes the per-layer scoring cost, which dominates only when compaction is
-   frequent: `buffer_size=16` gains **+73–86%** (546→942 at budget 512), while
-   `buffer_size=128` gains only **+7–11%**. Component profiling confirms the scoring
-   GPU time dropped **11.9 s → 1.5 s (−87%)** at budget 512 / buffer 16.
-2. **`buffer_size=16` is no longer a loss-leader.** Pre-opt, budget-512 throughput
-   was 2.5× worse at buffer 16 vs 128 (546 vs 1331); post-opt the gap shrinks to 1.5×
-   (942 vs 1430), so the aggressive / low-peak-memory `buffer_size=16` setting is now
-   practical (the pre-optimization advice was to avoid it — no longer true).
+1. **The gain scales with compaction frequency (`1/buffer_size`).** P3 moves the
+   `window_size` observation-window steps from eager onto the captured decode graph
+   (only the compaction step stays eager), so it pays off exactly when those
+   forced-eager steps are frequent: `buffer_size=16` gains **+34–41%** (942→1330 at
+   budget 512), `buffer_size=128` **+32–37%**, while `buffer_size ≥ 256` (few
+   compactions → few eager steps) is unchanged within noise. This stacks on the
+   earlier batched-scoring win, so vs the *original* per-layer-eager code the
+   `budget=512, buffer=16` point is now **~2.4×** (546 → 1330 tok/s).
+2. **`buffer_size=16` is now practical.** At budget 512 it reaches **1330 tok/s =
+   57% of full-KV**, up from 942 (41%) pre-P3 and 546 (24%) pre-optimization. The
+   aggressive, low-peak-memory setting no longer collapses throughput, and the
+   budget-512 gap to `buffer_size=128` is down to 1.5× (1330 vs 1966).
 3. **This workload barely compacts at large `budget`/`buffer_size`.** Compaction
-   triggers at `prompt + buffer_size` (≈697 + buffer) and the peak KV is only
-   ~863 tok, so `budget ≥ 1024` **or** `buffer_size ≥ 256` almost never fires (0–28
-   compactions) → throughput ~2150–2200 tok/s = full-KV, accuracy ~92%. Only
-   `budget ≤ 512` **and** `buffer_size ≤ 128` genuinely compress on GSM8K. To exercise
-   `budget=1024` (or large buffers) use a long-output workload (long-CoT model /
-   larger `max_new_tokens`).
-4. **Accuracy is preserved.** Every point's first-compaction A/B gate logged
-   `kept diff=0` (batched selection identical to the per-layer reference); the
-   ≤1.5-point wobble vs pre-opt is run-to-run concurrency-scheduling noise, not a
-   systematic change.
+   triggers at `prompt + buffer_size` (≈697 + buffer) and peak KV is only ~863 tok,
+   so `budget ≥ 1024` **or** `buffer_size ≥ 256` almost never fires (0–28
+   compactions) → throughput ~2100–2160 tok/s ≈ full-KV, accuracy ~92%. Only
+   `budget ≤ 512` **and** `buffer_size ≤ 128` genuinely compress on GSM8K. To
+   exercise `budget=1024` / large buffers use a long-output workload (long-CoT model
+   / larger `max_new_tokens`).
+4. **Accuracy is preserved and selection is bit-identical.** Every compacting
+   point's first-compaction A/B gate logged `kept diff=0` (no per-layer fallback),
+   and the in-graph collection is bit-identical to the old eager path (same
+   eviction, same greedy output at `concurrency=1`). The ≤2-point accuracy wobble
+   vs the pre-P3 pass is `--concurrency 32` scheduling noise, not a systematic
+   change; accuracy tracks `budget` (128 too aggressive at 69–84%; `budget ≥ 256`
+   ≈ full-KV).
 
 ---
 
