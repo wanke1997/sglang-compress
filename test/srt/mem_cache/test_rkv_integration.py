@@ -695,6 +695,31 @@ class TestPerRequestCursor(unittest.TestCase):
         comp.on_request_begin(_MockReq(1, 0, req_pool_idx=A))
         self.assertEqual(int(comp.step_count_of_req[A].item()), 0)
 
+    def test_reused_slot_window_has_no_stale_q(self):
+        # Request A fills its whole observation window, finishes, then request B
+        # reuses the SAME req_pool_idx. After B has run window_size steps its
+        # window must contain ONLY B's queries in order (no stale A data) — the
+        # invariant buffer_size >= window_size relies on, verified directly.
+        window = 3
+        comp = self._build(window=window)
+        X = 1  # shared req_pool_idx
+        comp.on_request_begin(_MockReq(1, 0, req_pool_idx=X))
+        for tag in (100.0, 101.0, 102.0):  # fill A's window
+            self._step(comp, [X], [tag])
+        wA = comp._read_window_rolling(X)[0, :, 0, 0]
+        self.assertEqual(wA.tolist(), [100.0, 101.0, 102.0])
+
+        comp.on_request_end(_MockReq(1, 0, req_pool_idx=X))
+        comp.on_request_begin(_MockReq(1, 0, req_pool_idx=X))  # B reuses slot X
+        for tag in (200.0, 201.0, 202.0):  # B's window_size fresh writes
+            self._step(comp, [X], [tag])
+
+        wB = comp._read_window_rolling(X)[0, :, 0, 0]
+        # Only B's queries, in temporal order; no A residue.
+        self.assertEqual(wB.tolist(), [200.0, 201.0, 202.0])
+        for stale in (100.0, 101.0, 102.0):
+            self.assertNotIn(stale, wB.tolist())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

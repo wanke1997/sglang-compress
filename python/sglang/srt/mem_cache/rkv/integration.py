@@ -368,6 +368,16 @@ class RKVCompressor:
         # buffer_size >= window_size (asserted in RKVConfig), which forces
         # >= window_size fresh writes before the first compaction, and by the
         # on_request_begin counter reset.
+        #
+        # CUDA-graph ordering: this eager ``+= 1`` is issued on the current
+        # stream, and the captured decode graph is replayed with a plain
+        # ``cuda_graph.replay()`` on that same current stream (see the
+        # full/tc-piecewise graph backends — no stream switch; overlap and
+        # PDMux, which could introduce a second stream, are rejected for R-KV).
+        # Same-stream ops execute in issue order, so the counter update
+        # happens-before the graph read of ``step_count_of_req`` — the identical
+        # guarantee ``set_kv_buffer`` (out_cache_loc written eagerly, read
+        # in-graph) already relies on.
         self.step_count_of_req[forward_batch.req_pool_indices] += 1
 
         if not self.states:
@@ -551,8 +561,14 @@ class RKVCompressor:
         if not self._armed:
             return
 
+        # Clear the armed set up front so a mid-loop exception (Triton failure,
+        # OOM, a kept-set assertion) cannot carry stale armed requests into the
+        # next forward. A request not prepared this pass simply re-arms later.
+        armed = self._armed
+        self._armed = set()
+
         seq_len_by_req = self._seq_len_by_req(forward_batch)
-        for req_pool_idx in list(self._armed):
+        for req_pool_idx in list(armed):
             state = self.states.get(req_pool_idx)
             if state is None:
                 continue
@@ -595,8 +611,6 @@ class RKVCompressor:
 
             self._pending_commits.append(self._prepare_compaction(state, seq_len, kept))
 
-        self._armed.clear()
-
     def commit_compactions(self) -> None:
         """Commit phase: apply every prepared compaction.
 
@@ -608,9 +622,12 @@ class RKVCompressor:
         """
         if not self._pending_commits:
             return
-        for plan in self._pending_commits:
+        # Drain up front so a mid-loop failure cannot re-commit an already-freed
+        # plan on a later call.
+        plans = self._pending_commits
+        self._pending_commits = []
+        for plan in plans:
             self._commit_compaction(plan)
-        self._pending_commits.clear()
 
     def _assemble_kept(self, score_accum: torch.Tensor, seq_len: int) -> torch.Tensor:
         """Global kept-token indices: top past tokens + trailing window.

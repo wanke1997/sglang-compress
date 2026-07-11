@@ -3166,7 +3166,17 @@ class Scheduler(
         """Register new R-KV requests and apply the previous step's physical KV
         length shrink to the batch seq_lens tensors, before prepare_for_decode
         advances them. seq_lens tracks physical KV length; rotary stays logical
-        via RKVCompressor.override_decode_positions at forward time."""
+        via RKVCompressor.override_decode_positions at forward time.
+
+        Ordering guarantee (why the next attention never reads a stale length):
+        this runs inside get_next_batch_to_run BEFORE ``batch.prepare_for_decode``
+        builds the next ForwardBatch (and does ``kv_committed_len += 1`` /
+        ``seq_lens += 1``). The compaction that produced these updates already
+        freed the tail slots and cleared ``req_to_token[budget:]`` in its commit
+        phase, so the physical KV is ``budget`` here; applying the shrink now,
+        before the ForwardBatch exists, means attention never sees the old
+        (longer) seq_len against the already-compacted req_to_token.
+        """
         for req in batch.reqs:
             st = self.rkv_compressor.states.get(req.req_pool_idx)
             if st is None or st.req is not req:
@@ -3177,6 +3187,16 @@ class Scheduler(
         for i, req in enumerate(batch.reqs):
             new_len = updates.get(req.req_pool_idx)
             if new_len is not None:
+                # Cross-check the two length-tracking paths agree AND that this
+                # runs before prepare_for_decode: the commit set both the pending
+                # update and kv_committed_len to budget, and prepare_for_decode
+                # (which would bump kv_committed_len to budget+1) has not run yet.
+                assert new_len == req.kv_committed_len, (
+                    f"R-KV length divergence for req_pool_idx={req.req_pool_idx}: "
+                    f"pending update {new_len} != kv_committed_len "
+                    f"{req.kv_committed_len} (compaction commit / decode-length "
+                    f"ordering broken)"
+                )
                 batch.seq_lens[i] = new_len
                 batch.seq_lens_cpu[i] = new_len
                 batch.orig_seq_lens[i] = new_len
