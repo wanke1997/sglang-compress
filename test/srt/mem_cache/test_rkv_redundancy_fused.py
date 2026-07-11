@@ -157,7 +157,9 @@ class TestDecodeR1KVFused(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.R1KV = _load("rkv_algo", "algo.py").R1KV
+        mod = _load("rkv_algo", "algo.py")
+        cls.R1KV = mod.R1KV
+        cls.cal_similarity = staticmethod(mod.cal_similarity)
 
     def _pair(self, budget=64, window=8):
         kw = dict(
@@ -215,6 +217,34 @@ class TestDecodeR1KVFused(unittest.TestCase):
         algo._scores(k, q)  # first call runs the smoke gate
         self.assertIsNotNone(algo._fused_redundancy)
         self.assertIsNot(algo._fused_redundancy, False)
+
+    def test_reference_redundancy_bounded_memory(self):
+        # The gate's CUDA reference must be the O(n)-memory tiled path, not the
+        # O(n^2) full matrix, which OOMs on long sequences (decode-mode
+        # long-prompt compaction, where n = prompt length).
+        n = 8192
+        torch.manual_seed(0)
+        key = torch.randn(1, 4, n, 128, device="cuda", dtype=torch.bfloat16)
+        algo = self.R1KV(budget=512, window_size=8, retain_direction="last")
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        ref = algo._reference_redundancy(key)
+        tiled_gb = torch.cuda.max_memory_allocated() / 1e9
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        full = self.cal_similarity(key, retain_direction="last")
+        full_gb = torch.cuda.max_memory_allocated() / 1e9
+
+        # O(n) tiled reference uses far less than the O(n^2) full matrix...
+        self.assertLess(
+            tiled_gb,
+            full_gb / 2,
+            f"reference not tiled: {tiled_gb:.2f} GB vs full {full_gb:.2f} GB",
+        )
+        # ...and is still bit-parity with it.
+        self.assertTrue(torch.allclose(ref.float(), full.float(), atol=1e-3, rtol=1e-2))
 
 
 if __name__ == "__main__":
