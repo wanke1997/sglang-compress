@@ -98,5 +98,56 @@ class TestFusedRedundancyNoRetain(unittest.TestCase):
         self.assertTrue(torch.allclose(sums, torch.ones_like(sums), atol=1e-4))
 
 
+@unittest.skipUnless(
+    _HAS_CUDA and _HAS_TRITON, "fused redundancy kernel needs CUDA + Triton"
+)
+class TestFusedRedundancyRetain(unittest.TestCase):
+    """Fused kernel WITH the retain exemption must match cal_similarity_tiled."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fused = staticmethod(
+            _load("rkv_redundancy_fused", "redundancy_fused.py").cal_similarity_fused
+        )
+        cls.tiled = staticmethod(
+            _load("rkv_prefill", "prefill.py").cal_similarity_tiled
+        )
+
+    def test_bitparity_fp32(self):
+        for thr in (0.0, 0.3, 0.5, 0.9):
+            for n in (37, 128, 512, 1500):
+                torch.manual_seed(n)
+                key = torch.randn(1, 4, n, 128, device="cuda", dtype=torch.float32)
+                ref = self.tiled(key, threshold=thr, retain_direction="last")
+                got = self.fused(key, threshold=thr)
+                self.assertTrue(
+                    torch.allclose(ref, got, atol=5e-4, rtol=1e-3),
+                    f"fp32 retain diverged thr={thr} n={n}: "
+                    f"max {(ref - got).abs().max().item():.3e}",
+                )
+
+    def test_parity_bf16(self):
+        for thr in (0.3, 0.5):
+            for n in (128, 512, 1500):
+                torch.manual_seed(n)
+                key = torch.randn(1, 4, n, 128, device="cuda", dtype=torch.bfloat16)
+                ref = self.tiled(key, threshold=thr, retain_direction="last")
+                got = self.fused(key, threshold=thr)
+                self.assertTrue(
+                    torch.allclose(ref.float(), got.float(), atol=3e-2, rtol=1e-3),
+                    f"bf16 retain diverged thr={thr} n={n}: "
+                    f"max {(ref.float() - got.float()).abs().max().item():.3e}",
+                )
+
+    def test_no_neighbor_defaults_to_col0(self):
+        # A very high threshold -> no above-threshold neighbours -> retain=col 0
+        # for every row (the reference's default). Must still match tiled.
+        torch.manual_seed(7)
+        key = torch.randn(1, 4, 300, 128, device="cuda", dtype=torch.float32)
+        ref = self.tiled(key, threshold=0.99, retain_direction="last")
+        got = self.fused(key, threshold=0.99)
+        self.assertTrue(torch.allclose(ref, got, atol=5e-4, rtol=1e-3))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

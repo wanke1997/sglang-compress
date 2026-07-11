@@ -45,6 +45,7 @@ same way as the reference: per-group logits are pooled down to ``kv_heads``.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Sequence
 
@@ -52,6 +53,30 @@ import torch
 import torch.nn.functional as F
 
 __all__ = ["cal_similarity_tiled", "RKVPrefill"]
+
+logger = logging.getLogger(__name__)
+
+# Lazily-loaded fused Triton redundancy kernel (CUDA-only). ``None`` = untried,
+# ``False`` = unavailable (no CUDA / no Triton), else the callable. Adoption is
+# gated per-compressor by a one-time smoke check against the tiled reference.
+_FUSED_REDUNDANCY = None
+
+
+def _get_fused_redundancy():
+    global _FUSED_REDUNDANCY
+    if _FUSED_REDUNDANCY is None:
+        try:
+            if torch.cuda.is_available():
+                from sglang.srt.mem_cache.rkv.redundancy_fused import (
+                    cal_similarity_fused,
+                )
+
+                _FUSED_REDUNDANCY = cal_similarity_fused
+            else:
+                _FUSED_REDUNDANCY = False
+        except Exception:  # pragma: no cover - triton/build issue -> fallback
+            _FUSED_REDUNDANCY = False
+    return _FUSED_REDUNDANCY
 
 
 def _attention_logits(query_states, key_states, pooling="max"):
@@ -174,6 +199,8 @@ class RKVPrefill:
         self.retain_direction = retain_direction
         self.sim_threshold = sim_threshold
         self.row_block = row_block
+        # Fused redundancy backend: None=untried, False=tiled fallback, else fn.
+        self._fused_redundancy = None
 
     # ------------------------------------------------------------------
     # Per-layer scoring (heads reduced by mean -> one score per past token)
@@ -206,17 +233,49 @@ class RKVPrefill:
         return attn_cache
 
     def _redundancy_past(self, keys: torch.Tensor) -> torch.Tensor:
-        """Tiled redundancy of each past token, averaged over kv heads.
+        """Redundancy of each past token, averaged over kv heads.
 
-        ``keys``: ``(1, kv_heads, n, d)``. Returns ``(1, kv_heads, n - window)``.
+        On CUDA with ``retain_direction='last'`` this uses the fused Triton
+        kernel, adopted once via a smoke gate against the tiled reference (a
+        gross mismatch -> permanent tiled fallback, logged). On CPU, without
+        Triton, or for other retain directions it uses the tiled reference.
+
+        ``keys``: ``(B, kv_heads, n, d)``. Returns ``(B, kv_heads, n - window)``.
         """
-        redundancy = cal_similarity_tiled(
+        redundancy = self._redundancy_full(keys)
+        return redundancy[:, :, : -self.window_size]
+
+    def _tiled_redundancy(self, keys: torch.Tensor) -> torch.Tensor:
+        return cal_similarity_tiled(
             keys,
             threshold=self.sim_threshold,
             retain_direction=self.retain_direction,
             row_block=self.row_block,
         )
-        return redundancy[:, :, : -self.window_size]
+
+    def _redundancy_full(self, keys: torch.Tensor) -> torch.Tensor:
+        if self.retain_direction != "last" or not keys.is_cuda:
+            return self._tiled_redundancy(keys)
+        if self._fused_redundancy is False:
+            return self._tiled_redundancy(keys)
+        if self._fused_redundancy is not None:
+            return self._fused_redundancy(keys, threshold=self.sim_threshold)
+        # First CUDA call: adopt the fused kernel iff it broadly matches tiled.
+        fn = _get_fused_redundancy()
+        if fn is False:
+            self._fused_redundancy = False
+            return self._tiled_redundancy(keys)
+        ref = self._tiled_redundancy(keys)
+        got = fn(keys, threshold=self.sim_threshold)
+        ok = ref.shape == got.shape and torch.allclose(
+            ref.float(), got.float(), atol=1e-3, rtol=1e-2
+        )
+        self._fused_redundancy = fn if ok else False
+        logger.info(
+            "R-KV-prefill fused-redundancy gate: %s",
+            "OK -> fused adopted" if ok else "DIVERGED -> tiled fallback",
+        )
+        return got if ok else ref
 
     def layer_past_score(
         self, keys: torch.Tensor, window_q: torch.Tensor
@@ -242,9 +301,9 @@ class RKVPrefill:
         Returns ``(B, n - window_size)`` — the same head-mean joint score as
         ``layer_past_score`` but without the bsz=1 ``squeeze``, so the whole
         stack of layers is scored in one batched pass instead of a Python loop.
-        The redundancy term (``cal_similarity_tiled``) and importance term
-        (``_attention_logits``) both already carry the batch dim, so this is a
-        pure batching of the existing per-layer math.
+        The redundancy term (fused Triton kernel, or ``cal_similarity_tiled``
+        fallback) and importance term (``_attention_logits``) both already carry
+        the batch dim, so this is a pure batching of the existing per-layer math.
         """
         importance = self._importance_past(keys, window_q)  # (B, kv_heads, n-w)
         redundancy = self._redundancy_past(keys)  # (B, kv_heads, n-w)
