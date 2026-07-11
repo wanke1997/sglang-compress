@@ -1048,6 +1048,99 @@ class ModelRunnerKVCacheMixin:
 
         self._init_pools()
 
+    @staticmethod
+    def _rkv_rolling_q_bytes(
+        num_layers: int,
+        window_size: int,
+        num_rows: int,
+        q_head_num: int,
+        head_dim: int,
+        elem_size: int,
+    ) -> int:
+        """Byte size of the R-KV decode rolling observation-query buffer.
+
+        Mirrors the allocation in
+        ``sglang.srt.mem_cache.rkv.integration.RKVCompressor.__init__``
+        (``zeros((num_layers, window_size, num_rows, q_head_num, head_dim))``).
+        Pure arithmetic so it is unit-testable without a GPU.
+        """
+        return (
+            int(num_layers)
+            * int(window_size)
+            * int(num_rows)
+            * int(q_head_num)
+            * int(head_dim)
+            * int(elem_size)
+        )
+
+    def _reserve_rkv_decode_aux_bytes(
+        self: ModelRunner, configurator, available_bytes: int, page_size: int
+    ) -> int:
+        """Subtract the R-KV decode rolling-query buffer from the KV budget.
+
+        ``RKVCompressor.rolling_q`` is allocated AFTER the KV pool, out of the
+        SAME GPU budget, with one row per request-pool slot
+        (``max_running_requests + 1``). It is never counted by the KV-slot
+        admission accounting (which only tracks pool tokens), so unless it is
+        reserved here it is charged against the post-pool headroom and can OOM
+        at startup or steal CUDA-graph capture space.
+
+        ``max_running_requests`` is only finalized from the pool size, so we use
+        the value it WOULD resolve to from the un-reserved budget as a safe
+        upper bound: reserving shrinks the budget, which can only keep or lower
+        the final count, so the real buffer never exceeds this reservation.
+        Returns the reduced ``available_bytes`` (kept strictly positive).
+        """
+        # Provisional request-pool row count from the un-reserved budget.
+        prov_tokens = configurator.calculate_pool_sizes(
+            available_bytes, page_size
+        ).max_total_num_tokens
+        num_rows = self._resolve_max_num_reqs(prov_tokens) + 1  # +1 padding row
+
+        window_size = self.server_args.rkv_window_size
+        if self.server_args.rkv_config:
+            import json
+
+            window_size = json.loads(self.server_args.rkv_config).get(
+                "window_size", window_size
+            )
+
+        q_head_num = self.model_config.get_num_attention_heads(self.tp_size)
+        aux_bytes = self._rkv_rolling_q_bytes(
+            num_layers=self.num_effective_layers,
+            window_size=window_size,
+            num_rows=num_rows,
+            q_head_num=q_head_num,
+            head_dim=self.model_config.head_dim,
+            elem_size=torch._utils._element_size(self.model_config.dtype),
+        )
+
+        reduced = available_bytes - aux_bytes
+        min_keep = getattr(configurator, "_cell_size", 0) or (1 << 20)
+        if reduced < min_keep:
+            logger.warning(
+                "R-KV decode rolling-query buffer (%.2f GiB) is too large for the "
+                "KV budget (%.2f GiB); clamping its reservation. Lower "
+                "--max-running-requests or --rkv-window-size.",
+                aux_bytes / (1 << 30),
+                available_bytes / (1 << 30),
+            )
+            reduced = min_keep
+        logger.info(
+            "R-KV decode: reserving %.2f GiB for the rolling-query buffer "
+            "(%d rows x %d layers x window %d x %d heads x %d dim); "
+            "KV budget %.2f -> %.2f GiB.",
+            aux_bytes / (1 << 30),
+            num_rows,
+            self.num_effective_layers,
+            window_size,
+            q_head_num,
+            self.model_config.head_dim,
+            available_bytes / (1 << 30),
+            reduced / (1 << 30),
+        )
+        return reduced
+
     def _resolve_memory_pool_config(
         self: ModelRunner, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
@@ -1060,6 +1153,15 @@ class ModelRunnerKVCacheMixin:
         page_size = self.server_args.page_size
 
         configurator = create_memory_pool_configurator(self)
+
+        # Reserve the R-KV decode rolling-query buffer up front so the KV pool
+        # leaves room for it (it is allocated afterwards from the same budget
+        # and is invisible to the KV-slot admission accounting).
+        if self.enable_rkv and not self.is_draft_worker:
+            available_bytes = self._reserve_rkv_decode_aux_bytes(
+                configurator, available_bytes, page_size
+            )
+
         config = configurator.calculate_pool_sizes(available_bytes, page_size)
 
         # Apply external constraints (user cap, page alignment, PP sync)

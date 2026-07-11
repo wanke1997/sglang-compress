@@ -227,13 +227,34 @@ class R1KV:
         if self._fused_redundancy is False:
             return self._reference_redundancy(key_states)
         if self._fused_redundancy is not None:
-            return self._fused_redundancy(key_states, threshold=0.5)
+            # Guard the adopted kernel: a runtime Triton compile/exec failure on
+            # an unusual shape must degrade to the reference, not crash the
+            # server (the load-time import guard only covers import, not exec).
+            try:
+                return self._fused_redundancy(key_states, threshold=0.5)
+            except Exception as e:  # pragma: no cover - hardware/shape dependent
+                logger.warning(
+                    "R-KV decode fused-redundancy kernel failed at runtime (%s); "
+                    "falling back to the reference permanently.",
+                    e,
+                )
+                self._fused_redundancy = False
+                return self._reference_redundancy(key_states)
         fn = _get_fused_redundancy()
         if fn is False:
             self._fused_redundancy = False
             return self._reference_redundancy(key_states)
         ref = self._reference_redundancy(key_states)
-        got = fn(key_states, threshold=0.5)
+        try:
+            got = fn(key_states, threshold=0.5)
+        except Exception as e:  # pragma: no cover - hardware/shape dependent
+            logger.warning(
+                "R-KV decode fused-redundancy kernel unavailable at runtime (%s); "
+                "using the reference permanently.",
+                e,
+            )
+            self._fused_redundancy = False
+            return ref
         ok = ref.shape == got.shape and torch.allclose(
             ref.float(), got.float(), atol=1e-3, rtol=1e-2
         )

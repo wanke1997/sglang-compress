@@ -191,6 +191,15 @@ class RKVCompressor:
         # op as set_kv_buffer writing token_to_kv_pool at out_cache_loc -- so the
         # observation-window steps no longer need to run eager. Circular over
         # window_size; the write slot is a global (batch-synchronous) counter.
+        #
+        # Row count == req_to_token rows == max_running_requests + 1, so there is
+        # exactly one row per possible concurrent request (no oversized pool: the
+        # decode concurrency ceiling IS the row count). Row 0 is the reserved
+        # ReqToTokenPool padding slot (never assigned to a real request), which is
+        # what makes the unconditional in-graph scatter safe under CUDA-graph
+        # padding -- see collect_decode_query. This buffer is reserved in the KV
+        # pool sizing (ModelRunner._reserve_rkv_decode_aux_bytes) so it cannot OOM
+        # at startup.
         max_reqs = req_to_token_pool.req_to_token.shape[0]
         window = config.window_size
         self.rolling_q = torch.zeros(
@@ -293,6 +302,20 @@ class RKVCompressor:
         # managed requests) and refresh the fixed-address GPU scalar the captured
         # rolling_q scatter reads. begin_decode_step runs BEFORE the graph/eager
         # decision, so this refresh reaches graph-replay steps.
+        #
+        # A single global (batch-synchronous) cursor is correct because every
+        # managed request participates in EVERY decode step between two of its
+        # compactions under the enforced config: overlap scheduling is rejected
+        # (_handle_rkv_validation), continuous batching keeps a running decode
+        # request in every decode batch until it finishes/retracts, and this
+        # counter only advances on decode forwards (prefill batches don't call
+        # begin_decode_step). So the last window_size global slots hold this
+        # request's last window_size queries in order. Reused req_pool_idx slots
+        # (a finished request's row taken by a new one) are safe because
+        # buffer_size >= window_size (asserted in RKVConfig) forces >= window_size
+        # fresh writes before the new request's first compaction. If a future
+        # config lets a managed request skip decode steps (preemption, pipeline,
+        # re-enabled overlap), switch to a per-request GPU cursor here.
         self._global_step += 1
         self.window_slot.fill_(self._global_step % self.config.window_size)
 
@@ -340,6 +363,13 @@ class RKVCompressor:
         class of op as ``set_kv_buffer`` scattering into ``token_to_kv_pool`` at
         ``out_cache_loc``. This is what lets observation-window steps stop
         running eager (P3). Unconditional so CUDA-graph capture includes it.
+
+        CUDA-graph padding safety: a padded replay batch fills the tail
+        ``req_pool_indices`` with 0 (PaddingPolicy.ZERO), so padding rows scatter
+        their (discarded) query into ``rolling_q`` row 0 -- the reserved
+        ReqToTokenPool padding slot, never a real request -- exactly as those
+        rows write ``token_to_kv_pool`` at ``out_cache_loc`` 0. No real request's
+        observation window is corrupted.
         """
         layer_idx = layer.layer_id - self.start_layer
         # Flattened index into (window * max_reqs): slot-major, req-minor.
@@ -536,8 +566,27 @@ class RKVCompressor:
         r2t = self.req_to_token_pool.req_to_token
 
         slots = r2t[idx, :seq_len].long().clone()  # physical slots, temporal order
+
+        # Validate the kept set BEFORE mutating any buffer, so a bad score/select
+        # can never leave the request half-relocated or double-free a slot
+        # (crash-consistency: every check below is on indices only, no KV writes
+        # have happened yet). Cheap: O(budget), once per compaction.
+        assert kept_local.numel() == budget, (
+            f"R-KV kept set has {kept_local.numel()} entries, expected budget "
+            f"{budget}"
+        )
+        assert kept_local.numel() == 0 or (
+            int(kept_local.min()) >= 0 and int(kept_local.max()) < seq_len
+        ), "R-KV kept indices out of range [0, seq_len)"
+        assert bool(
+            torch.all(kept_local[1:] > kept_local[:-1])
+        ), "R-KV kept indices must be strictly ascending (unique, sorted)"
+
         src = slots[kept_local]  # surviving physical slots (budget,)
         dst = slots[:budget]  # target front slots (budget,)
+        assert (
+            src.unique().numel() == src.numel()
+        ), "R-KV kept set maps to duplicate physical slots (would double-free)"
 
         # Relocate K/V for every layer. Clone before write so overlapping
         # src/dst ranges don't corrupt each other.

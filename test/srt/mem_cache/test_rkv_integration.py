@@ -478,5 +478,138 @@ class TestLifecycle(unittest.TestCase):
         self.assertEqual(len(comp.states), 0)
 
 
+class TestCompactInvariants(unittest.TestCase):
+    """A bad kept set must fail fast BEFORE any KV buffer is mutated or freed,
+    so a scoring/selection bug can never leave a request half-relocated or
+    double-free a physical slot (crash-consistency)."""
+
+    def setUp(self):
+        self.device = torch.device("cpu")
+        self.num_layers = 2
+        self.head_num = 2
+        self.head_dim = 4
+        self.budget = 4
+        self.window = 2
+        self.seq_len = 6
+        self.req_pool_idx = 1
+        self.num_slots = 32
+
+        self.r2t_pool = MockReqToTokenPool(4, 64, self.device)
+        self.kv_pool = MockKVPool(
+            self.num_layers,
+            self.num_slots,
+            self.head_num,
+            self.head_dim,
+            self.device,
+            torch.float32,
+        )
+        self.alloc = MockAllocator()
+        self.comp = RKVCompressor(
+            config=RKVConfig(
+                budget=self.budget, window_size=self.window, buffer_size=4
+            ),
+            req_to_token_pool=self.r2t_pool,
+            token_to_kv_pool=self.kv_pool,
+            kv_allocator=self.alloc,
+            start_layer=0,
+            end_layer=self.num_layers,
+            device=self.device,
+            q_head_num=self.head_num,
+            head_dim=self.head_dim,
+            q_dtype=torch.float32,
+        )
+        self.slots = torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int32)
+        self.r2t_pool.req_to_token[self.req_pool_idx, : self.seq_len] = self.slots
+        self._k_snapshot = [
+            self.kv_pool.get_key_buffer(l).clone() for l in range(self.num_layers)
+        ]
+        self.state = RKVRequestState(req_pool_idx=self.req_pool_idx)
+
+    def _assert_no_mutation(self):
+        # No slot was freed and no KV buffer changed.
+        self.assertEqual(len(self.alloc.freed), 0)
+        for l in range(self.num_layers):
+            self.assertTrue(
+                torch.equal(self.kv_pool.get_key_buffer(l), self._k_snapshot[l])
+            )
+
+    def test_wrong_length_raises(self):
+        with self.assertRaises(AssertionError):
+            self.comp._compact_request(
+                self.state, self.seq_len, torch.tensor([0, 2, 5])  # 3 != budget 4
+            )
+        self._assert_no_mutation()
+
+    def test_non_ascending_raises(self):
+        with self.assertRaises(AssertionError):
+            # descending / unsorted kept indices
+            self.comp._compact_request(
+                self.state, self.seq_len, torch.tensor([3, 1, 4, 5])
+            )
+        self._assert_no_mutation()
+
+    def test_duplicate_index_raises(self):
+        with self.assertRaises(AssertionError):
+            # 4 appears twice -> not strictly ascending AND duplicate slot
+            self.comp._compact_request(
+                self.state, self.seq_len, torch.tensor([1, 4, 4, 5])
+            )
+        self._assert_no_mutation()
+
+    def test_out_of_range_raises(self):
+        with self.assertRaises(AssertionError):
+            # index 6 >= seq_len 6
+            self.comp._compact_request(
+                self.state, self.seq_len, torch.tensor([0, 2, 4, 6])
+            )
+        self._assert_no_mutation()
+
+    def test_valid_kept_still_compacts(self):
+        # Sanity: a valid ascending, in-range, budget-sized kept set proceeds.
+        self.comp._compact_request(self.state, self.seq_len, torch.tensor([0, 2, 4, 5]))
+        self.assertEqual(len(self.alloc.freed), 1)
+
+
+class TestRollingQSizeContract(unittest.TestCase):
+    """Pin the rolling_q allocation shape/bytes that the KV-pool reservation
+    (ModelRunner._reserve_rkv_decode_aux_bytes) is computed from. If the buffer
+    layout changes, the reservation formula must change with it — this test
+    fails loudly to force that."""
+
+    def test_bytes_match_reservation_formula(self):
+        num_reqs, num_layers, window = 5, 3, 8
+        q_heads, head_dim = 7, 16
+        dtype = torch.bfloat16
+        comp = RKVCompressor(
+            config=RKVConfig(budget=64, window_size=window),
+            req_to_token_pool=MockReqToTokenPool(num_reqs, 128, torch.device("cpu")),
+            token_to_kv_pool=MockKVPool(
+                num_layers, 128, 2, head_dim, torch.device("cpu"), dtype
+            ),
+            kv_allocator=MockAllocator(),
+            start_layer=0,
+            end_layer=num_layers,
+            device=torch.device("cpu"),
+            q_head_num=q_heads,
+            head_dim=head_dim,
+            q_dtype=dtype,
+        )
+        # Rows == req_to_token rows == num_reqs + 1 (reserved padding row).
+        expected_rows = num_reqs + 1
+        self.assertEqual(comp.rolling_q.shape[2], expected_rows)
+        actual_bytes = comp.rolling_q.numel() * comp.rolling_q.element_size()
+        # Same product the mixin helper computes.
+        formula_bytes = (
+            num_layers
+            * window
+            * expected_rows
+            * q_heads
+            * head_dim
+            * torch.finfo(dtype).bits
+            // 8
+        )
+        self.assertEqual(actual_bytes, formula_bytes)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

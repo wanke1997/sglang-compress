@@ -259,14 +259,37 @@ class RKVPrefill:
         if self._fused_redundancy is False:
             return self._tiled_redundancy(keys)
         if self._fused_redundancy is not None:
-            return self._fused_redundancy(keys, threshold=self.sim_threshold)
-        # First CUDA call: adopt the fused kernel iff it broadly matches tiled.
+            # Adopted fused kernel. Guard the call: a runtime Triton compile/exec
+            # failure on an unusual shape must degrade to the tiled reference, not
+            # crash the server (the load-time import guard in
+            # ``_get_fused_redundancy`` only covers import, not per-call exec).
+            try:
+                return self._fused_redundancy(keys, threshold=self.sim_threshold)
+            except Exception as e:  # pragma: no cover - hardware/shape dependent
+                logger.warning(
+                    "R-KV-prefill fused-redundancy kernel failed at runtime (%s); "
+                    "falling back to the tiled reference permanently.",
+                    e,
+                )
+                self._fused_redundancy = False
+                return self._tiled_redundancy(keys)
+        # First CUDA call: adopt the fused kernel iff it runs AND broadly matches
+        # tiled. Any kernel failure -> permanent tiled fallback (no crash).
         fn = _get_fused_redundancy()
         if fn is False:
             self._fused_redundancy = False
             return self._tiled_redundancy(keys)
         ref = self._tiled_redundancy(keys)
-        got = fn(keys, threshold=self.sim_threshold)
+        try:
+            got = fn(keys, threshold=self.sim_threshold)
+        except Exception as e:  # pragma: no cover - hardware/shape dependent
+            logger.warning(
+                "R-KV-prefill fused-redundancy kernel unavailable at runtime (%s); "
+                "using the tiled reference permanently.",
+                e,
+            )
+            self._fused_redundancy = False
+            return ref
         ok = ref.shape == got.shape and torch.allclose(
             ref.float(), got.float(), atol=1e-3, rtol=1e-2
         )
