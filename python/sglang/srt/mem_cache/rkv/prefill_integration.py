@@ -84,8 +84,6 @@ class RKVPrefillRequestState:
         self.req_pool_idx = req_pool_idx
         # oneshot: latched True after the single prompt compaction.
         self.compressed = False
-        # Cross-layer per-past-token score accumulator (oneshot).
-        self.score_accum: Optional[torch.Tensor] = None
         self.observed_seq_len: int = 0
         # Full prompt length in KV tokens (set in on_request_begin).
         self.prompt_len: int = 0
@@ -144,6 +142,13 @@ class RKVPrefillCompressor:
         self.states: Dict[int, RKVPrefillRequestState] = {}
         self._armed: set[int] = set()
         self.pending_length_updates: Dict[int, int] = {}
+        # Batched-scoring A/B gate: None = not yet checked, True = batched selects
+        # the same past tokens as the per-layer reference (adopted), False = they
+        # differed on the first compaction (per-layer fallback forever).
+        self._batched_ok: Optional[bool] = None
+        # Cap the batched-scoring transient so peak memory stays bounded for long
+        # prompts (the tiled cosine block dominates).
+        self._score_chunk_bytes: int = 512 << 20
 
     # ------------------------------------------------------------------
     # Request lifecycle
@@ -268,22 +273,14 @@ class RKVPrefillCompressor:
                     start + (ov_start - prefix) : start + (ov_end - prefix)
                 ]
 
-            # Score + arm only on the FINAL prefill chunk.
+            # Arm only on the FINAL prefill chunk; scoring is batched across all
+            # layers in ``_compact_oneshot`` after the forward (not accumulated
+            # per layer here).
             if prefix + extend_len < prompt_len:
                 continue
             if layer_idx == 0:
                 self._armed.add(req_pool_idx)
-                state.score_accum = None
                 state.observed_seq_len = prompt_len
-            if req_pool_idx in self._armed and state.window_q is not None:
-                layer_score = self._layer_score(
-                    req_pool_idx, prompt_len, state.window_q[layer_idx], layer_idx
-                )
-                state.score_accum = (
-                    layer_score
-                    if state.score_accum is None
-                    else state.score_accum + layer_score
-                )
 
     def _observe_buffered(self, q, req_indices, seq_lens, extend_lens, layer_idx):
         """Route B: maintain the sliding window and the ``kept_orig`` set, and
@@ -358,39 +355,103 @@ class RKVPrefillCompressor:
         kept = state.kept_orig
         r2t = self.req_to_token_pool.req_to_token
         phys_slots = r2t[req_pool_idx, kept].long()
-        score = None
-        for layer_idx in range(self.num_layers):
-            layer_id = self.start_layer + layer_idx
-            k_buffer = self.token_to_kv_pool.get_key_buffer(layer_id)
-            keys = k_buffer[phys_slots].unsqueeze(0).transpose(1, 2).contiguous()
-            queries = (
-                state.window_q[layer_idx].unsqueeze(0).transpose(1, 2).contiguous()
-            )
-            s = self.algo.layer_past_score(keys, queries)
-            score = s if score is None else score + s
+        score = self._past_scores(phys_slots, state.window_q)
         local = self.algo._select_from_score(score, kept.numel())
         state.kept_orig = kept.index_select(0, local)
 
-    def _layer_score(
-        self,
-        req_pool_idx: int,
-        seq_len: int,
-        window_q: torch.Tensor,
-        layer_idx: int,
+    def _reference_scores(
+        self, slots: torch.Tensor, window_q_all: torch.Tensor
     ) -> torch.Tensor:
-        """Per-past-token joint R-KV score for one layer, averaged over kv heads.
+        """Per-layer sequential scoring over ``slots`` (original path; A/B ref).
 
-        Reads this request's ``seq_len`` prompt keys from the pool and scores
-        them against ``window_q`` (the observation window). Returns
-        ``(seq_len - window_size,)``.
+        Sums the per-layer head-mean scores in layer order. ``slots`` are the
+        physical KV slots to score; ``window_q_all`` is
+        ``(num_layers, window, q_heads, head_dim)``. Returns
+        ``(len(slots) - window_size,)``.
         """
-        layer_id = self.start_layer + layer_idx
-        r2t = self.req_to_token_pool.req_to_token
-        slots = r2t[req_pool_idx, :seq_len].long()
-        k_buffer = self.token_to_kv_pool.get_key_buffer(layer_id)
-        keys = k_buffer[slots].unsqueeze(0).transpose(1, 2).contiguous()
-        queries = window_q.unsqueeze(0).transpose(1, 2).contiguous()
-        return self.algo.layer_past_score(keys, queries)
+        acc: Optional[torch.Tensor] = None
+        for layer_idx in range(self.num_layers):
+            layer_id = self.start_layer + layer_idx
+            k_buffer = self.token_to_kv_pool.get_key_buffer(layer_id)
+            keys = k_buffer[slots].unsqueeze(0).transpose(1, 2).contiguous()
+            queries = window_q_all[layer_idx].unsqueeze(0).transpose(1, 2).contiguous()
+            s = self.algo.layer_past_score(keys, queries)
+            acc = s if acc is None else acc + s
+        return acc
+
+    def _batched_scores(
+        self, slots: torch.Tensor, window_q_all: torch.Tensor
+    ) -> torch.Tensor:
+        """Batched all-layer scoring over ``slots`` in one pass per chunk.
+
+        Stacks every layer's K for ``slots`` into one
+        ``(chunk, kv_heads, n, head_dim)`` batch and runs one
+        ``algo.batched_past_score`` (num_layers as the batch dim) instead of
+        ``num_layers`` bsz=1 calls, then cross-layer sum in layer order (matching
+        ``_reference_scores``). Chunked over layers so the tiled cosine transient
+        stays under ``_score_chunk_bytes``. Returns ``(len(slots) - window,)``.
+        """
+        queries_all = window_q_all.transpose(1, 2).contiguous()  # (L, q_heads, w, hd)
+        n = int(slots.numel())
+        k0 = self.token_to_kv_pool.get_key_buffer(self.start_layer)
+        kv_heads = k0.shape[1]
+        # The tiled cosine block (fp32, kv_heads x row_block x n) dominates peak.
+        row_block = min(self.config.row_block, n)
+        per_layer = max(1, 4 * kv_heads * row_block * n)
+        chunk = max(1, min(self.num_layers, self._score_chunk_bytes // per_layer))
+
+        acc: Optional[torch.Tensor] = None
+        for c in range(0, self.num_layers, chunk):
+            hi = min(c + chunk, self.num_layers)
+            keys = (
+                torch.stack(
+                    [
+                        self.token_to_kv_pool.get_key_buffer(self.start_layer + l)[
+                            slots
+                        ]
+                        for l in range(c, hi)
+                    ]
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )  # (chunk, kv_heads, n, hd)
+            layer_scores = self.algo.batched_past_score(keys, queries_all[c:hi])
+            for li in range(layer_scores.shape[0]):
+                s = layer_scores[li]
+                acc = s if acc is None else acc + s
+        return acc
+
+    def _past_scores(
+        self, slots: torch.Tensor, window_q_all: torch.Tensor
+    ) -> torch.Tensor:
+        """Cross-layer past-token score over ``slots``, batched with a first-call
+        A/B gate against the per-layer reference (permanent fallback if the
+        selected past tokens differ, protecting accuracy).
+        """
+        if self._batched_ok is None:
+            ref = self._reference_scores(slots, window_q_all)
+            bat = self._batched_scores(slots, window_q_all)
+            num_past = self.config.budget - self.config.window_size
+            ok = ref.shape == bat.shape and ref.numel() >= num_past
+            if ok:
+                ref_top = torch.sort(ref.topk(num_past).indices).values
+                bat_top = torch.sort(bat.topk(num_past).indices).values
+                ok = bool(torch.equal(ref_top, bat_top))
+            self._batched_ok = ok
+            logger.info(
+                "R-KV-prefill batched-scoring gate: %s",
+                (
+                    "OK -> batched adopted"
+                    if self._batched_ok
+                    else "DIFFER -> per-layer fallback"
+                ),
+            )
+            return bat if self._batched_ok else ref
+        return (
+            self._batched_scores(slots, window_q_all)
+            if self._batched_ok
+            else self._reference_scores(slots, window_q_all)
+        )
 
     # ------------------------------------------------------------------
     # Compaction (after an extend forward)
@@ -404,12 +465,15 @@ class RKVPrefillCompressor:
     def _compact_oneshot(self) -> None:
         if not self._armed:
             return
+        r2t = self.req_to_token_pool.req_to_token
         for req_pool_idx in list(self._armed):
             state = self.states.get(req_pool_idx)
-            if state is None or state.compressed or state.score_accum is None:
+            if state is None or state.compressed or state.window_q is None:
                 continue
             seq_len = state.observed_seq_len
-            kept = self._assemble_kept(state.score_accum, seq_len)
+            slots = r2t[req_pool_idx, :seq_len].long()
+            score = self._past_scores(slots, state.window_q)
+            kept = self._assemble_kept(score, seq_len)
             self._compact_request(state, seq_len, kept, latch=True)
         self._armed.clear()
 

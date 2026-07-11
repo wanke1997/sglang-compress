@@ -191,5 +191,42 @@ class TestRouteInvariants(unittest.TestCase):
         self.assertGreaterEqual(m["premature_evictions"], 0)
 
 
+class TestBatchedScoreParity(unittest.TestCase):
+    """``batched_past_score`` over stacked layers == per-layer ``layer_past_score`` sum."""
+
+    def test_batched_equals_per_layer_sum(self):
+        torch.manual_seed(3)
+        num_layers, kv_heads, q_heads, n, window, d = 4, 2, 8, 96, 8, 16
+        budget = 32
+        pf = RKVPrefill(budget=budget, window_size=window, mix_lambda=0.1)
+        keys = torch.randn(num_layers, kv_heads, n, d, dtype=torch.float32)
+        window_q = torch.randn(num_layers, q_heads, window, d, dtype=torch.float32)
+
+        # Per-layer reference (bsz=1 loop, summed over layers).
+        ref = None
+        for layer in range(num_layers):
+            s = pf.layer_past_score(
+                keys[layer : layer + 1], window_q[layer : layer + 1]
+            )
+            ref = s if ref is None else ref + s
+
+        # Batched (num_layers as the batch dim), summed over layers.
+        bat = pf.batched_past_score(keys, window_q).sum(dim=0)  # (n-w,)
+
+        self.assertEqual(ref.shape, bat.shape)
+        self.assertTrue(
+            torch.allclose(ref, bat, atol=1e-5, rtol=1e-5),
+            f"batched score diverged: max abs {(ref - bat).abs().max().item():.3e}",
+        )
+        # The selection (top past tokens) must be identical — this is the gate.
+        num_past = budget - window
+        self.assertTrue(
+            torch.equal(
+                torch.sort(ref.topk(num_past).indices).values,
+                torch.sort(bat.topk(num_past).indices).values,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
