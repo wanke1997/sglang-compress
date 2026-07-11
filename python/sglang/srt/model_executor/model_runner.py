@@ -884,6 +884,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 start_layer=self.start_layer,
                 end_layer=self.start_layer + self.num_effective_layers,
                 device=self.device,
+                q_head_num=self.model_config.get_num_attention_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                q_dtype=self.model_config.dtype,
             )
 
         if self.enable_rkv_prefill:
@@ -3066,10 +3069,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else forward_batch.forward_mode.is_cuda_graph
             )
             # R-KV decode: advance per-request compaction counters EVERY decode
-            # step (this must run even on graph-replay steps, where the
-            # observe_decode_layer hook inside forward_decode is skipped) and
-            # force this step to run eager when it falls in an observation window
-            # or is a compaction step, so observe + maybe_compact execute.
+            # step (this must run even on graph-replay steps) and force this step
+            # to run eager ONLY when it is a compaction step, so maybe_compact
+            # executes (it runs on the eager path; the graph path returns before
+            # it). Observation-window queries are collected in-graph by
+            # collect_decode_query, so the window steps replay the captured graph.
             rkv_force_eager = (
                 forward_batch.forward_mode.is_decode()
                 and self.rkv_compressor is not None

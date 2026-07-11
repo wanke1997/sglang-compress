@@ -124,6 +124,9 @@ class TestAssembleKept(unittest.TestCase):
             start_layer=0,
             end_layer=1,
             device=torch.device("cpu"),
+            q_head_num=1,
+            head_dim=4,
+            q_dtype=torch.float32,
         )
 
     def test_kept_is_top_past_plus_window_sorted(self):
@@ -179,6 +182,9 @@ class TestCompactRequest(unittest.TestCase):
             start_layer=0,
             end_layer=self.num_layers,
             device=self.device,
+            q_head_num=self.head_num,
+            head_dim=self.head_dim,
+            q_dtype=self.dtype,
         )
 
         # Physical slots this request occupies, in temporal order.
@@ -199,13 +205,7 @@ class TestCompactRequest(unittest.TestCase):
                 kb[s] = pattern
                 vb[s] = pattern + 0.5  # distinguish V from K
 
-        self.state = RKVRequestState(
-            req_pool_idx=self.req_pool_idx,
-            num_layers=self.num_layers,
-            window_size=self.window,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        self.state = RKVRequestState(req_pool_idx=self.req_pool_idx)
 
     def test_relocation_free_and_rewrite(self):
         # Keep past tokens {0, 2} plus the window {4, 5}. Ascending.
@@ -332,6 +332,9 @@ class TestBatchObserve(unittest.TestCase):
             start_layer=0,
             end_layer=self.num_layers,
             device=self.device,
+            q_head_num=self.head_num,
+            head_dim=self.head_dim,
+            q_dtype=self.dtype,
         )
 
         # req A (idx 1): long enough to be eligible; req B (idx 2): short.
@@ -354,8 +357,11 @@ class TestBatchObserve(unittest.TestCase):
 
     def _forward_batch(self):
         return types.SimpleNamespace(
+            # req_pool_indices is int64 in the real runtime (schedule_batch and
+            # every cuda-graph runner allocate it as torch.int64); match that so
+            # the in-graph collect_decode_query index arithmetic is a long index.
             req_pool_indices=torch.tensor(
-                [self.long_idx, self.short_idx], dtype=torch.int32
+                [self.long_idx, self.short_idx], dtype=torch.int64
             ),
             seq_lens=torch.tensor([self.long_len, self.short_len], dtype=torch.int32),
             seq_lens_cpu=torch.tensor(
@@ -368,13 +374,14 @@ class TestBatchObserve(unittest.TestCase):
         torch.manual_seed(0)
         fb = self._forward_batch()
 
-        # Feed buffer_size decode steps; each step touches all layers.
+        # Feed buffer_size decode steps; each step refreshes the write slot and
+        # collects every layer's query into the in-graph rolling buffer.
         for _ in range(self.buffer_size):
             self.comp.begin_decode_step(fb)
             for layer_idx in range(self.num_layers):
                 layer = types.SimpleNamespace(layer_id=layer_idx)
                 q = torch.randn(2, self.head_num, self.head_dim)
-                self.comp.observe_decode_layer(q, None, None, layer, fb)
+                self.comp.collect_decode_query(q, layer, fb)
 
         # Long request armed; short request did not.
         self.assertIn(self.long_idx, self.comp._armed)
@@ -387,15 +394,11 @@ class TestBatchObserve(unittest.TestCase):
         )
         self.assertEqual(self.comp.states[self.short_idx].steps_since_compact, 0)
 
-        # observe's new job is only to capture window queries; scoring moved to
-        # maybe_compact. The armed (long) request has a filled window; the short
-        # request never armed so its window was never allocated.
-        long_state = self.comp.states[self.long_idx]
-        self.assertIsNotNone(long_state.window_q)
-        self.assertIsNone(self.comp.states[self.short_idx].window_q)
-
-        # Batched scoring produces the right shape and matches the per-layer
+        # Scoring reads the observation window from the rolling buffer, exactly
+        # as maybe_compact does. Batched scoring must match the per-layer
         # reference (the invariant the A/B gate relies on).
+        long_state = self.comp.states[self.long_idx]
+        long_state.window_q = self.comp._read_window_rolling(self.long_idx)
         ref = self.comp._reference_scores(long_state, self.long_len)
         bat = self.comp._batched_scores(long_state, self.long_len)
         self.assertEqual(ref.shape, (self.long_len - self.window,))
@@ -403,20 +406,18 @@ class TestBatchObserve(unittest.TestCase):
         self.assertTrue(torch.allclose(ref, bat, atol=1e-4))
 
     def test_eager_gating_schedule(self):
-        # begin_decode_step must force EAGER only on the window_size steps ending
-        # at a compaction (so observe can capture queries); other steps may run
-        # on the CUDA graph. window=2, buffer=3 -> first window step at
-        # steps_since_compact==2, compaction at 3.
+        # begin_decode_step forces EAGER only on the compaction step now: the
+        # window queries are collected in-graph, so the observation-window steps
+        # replay the captured graph. window=2, buffer=3 -> compaction (and the
+        # only eager step) at steps_since_compact==3.
         self._build()
         fb = self._forward_batch()
         needs = [self.comp.begin_decode_step(fb) for _ in range(self.buffer_size)]
-        self.assertEqual(needs, [False, True, True])
-        # Last step is the compaction step: newest window slot + armed.
-        long_state = self.comp.states[self.long_idx]
-        self.assertEqual(long_state.this_step_window_slot, self.window - 1)
+        self.assertEqual(needs, [False, False, True])
+        # Last step is the compaction step: the long request armed.
         self.assertIn(self.long_idx, self.comp._armed)
-        # The short request (below min_seq_len) never forces eager.
-        self.assertEqual(self.comp.states[self.short_idx].this_step_window_slot, -1)
+        # The short request (below min_seq_len) never arms or forces eager.
+        self.assertNotIn(self.short_idx, self.comp._armed)
         self.assertEqual(self.comp.states[self.short_idx].steps_since_compact, 0)
 
     def test_maybe_compact_uses_per_request_seq_len(self):
@@ -428,7 +429,7 @@ class TestBatchObserve(unittest.TestCase):
             for layer_idx in range(self.num_layers):
                 layer = types.SimpleNamespace(layer_id=layer_idx)
                 q = torch.randn(2, self.head_num, self.head_dim)
-                self.comp.observe_decode_layer(q, None, None, layer, fb)
+                self.comp.collect_decode_query(q, layer, fb)
 
         self.comp.maybe_compact(fb)
 
@@ -452,6 +453,9 @@ class TestLifecycle(unittest.TestCase):
             start_layer=0,
             end_layer=2,
             device=torch.device("cpu"),
+            q_head_num=2,
+            head_dim=4,
+            q_dtype=torch.float32,
         )
 
     def test_begin_registers_and_end_clears_state(self):

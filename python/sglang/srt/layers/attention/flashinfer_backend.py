@@ -1146,14 +1146,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
         rkv_compressor = self.rkv_compressor
         if rkv_compressor is not None:
-            # Observe this layer's decode step (cache query, accumulate score).
-            rkv_compressor.observe_decode_layer(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k,
-                v,
-                layer,
-                forward_batch,
-            )
+            q_view = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            # (1c) In-graph rolling query collection: captured in the decode
+            # graph (like set_kv_buffer), so graph-replay steps collect too.
+            # Unconditional -> capture includes it. Lets window steps stop eager.
+            rkv_compressor.collect_decode_query(q_view, layer, forward_batch)
 
         # Call the wrapped function
         o = decode_wrapper.forward(
