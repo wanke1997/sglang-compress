@@ -108,6 +108,13 @@ class _MockReq:
         self.req_pool_idx = req_pool_idx
 
 
+def _prepare_and_commit(comp, state, seq_len, kept):
+    """Two-phase compaction convenience for tests: prepare (relocate K/V) then
+    commit (free tail + bookkeeping), mirroring maybe_compact + the scheduler's
+    commit_compactions()."""
+    comp._commit_compaction(comp._prepare_compaction(state, seq_len, kept))
+
+
 # --------------------------------------------------------------------------- #
 # Tests                                                                       #
 # --------------------------------------------------------------------------- #
@@ -222,7 +229,7 @@ class TestCompactRequest(unittest.TestCase):
             for l in range(self.num_layers)
         ]
 
-        self.comp._compact_request(self.state, self.seq_len, kept_local)
+        _prepare_and_commit(self.comp, self.state, self.seq_len, kept_local)
 
         # (1) Front `budget` dst slots now hold the kept KV, in temporal order.
         for l in range(self.num_layers):
@@ -259,7 +266,7 @@ class TestCompactRequest(unittest.TestCase):
             self.kv_pool.get_key_buffer(l)[src].clone() for l in range(self.num_layers)
         ]
 
-        self.comp._compact_request(self.state, self.seq_len, kept_local)
+        _prepare_and_commit(self.comp, self.state, self.seq_len, kept_local)
 
         for l in range(self.num_layers):
             self.assertTrue(
@@ -273,7 +280,7 @@ class TestCompactRequest(unittest.TestCase):
         self.state.req = req
         kept_local = torch.tensor([0, 2, 4, 5])
 
-        self.comp._compact_request(self.state, self.seq_len, kept_local)
+        _prepare_and_commit(self.comp, self.state, self.seq_len, kept_local)
 
         # Physical length shrunk to budget on the request.
         self.assertEqual(req.kv_committed_len, self.budget)
@@ -432,6 +439,7 @@ class TestBatchObserve(unittest.TestCase):
                 self.comp.collect_decode_query(q, layer, fb)
 
         self.comp.maybe_compact(fb)
+        self.comp.commit_compactions()
 
         # Only the long request was compacted, shrunk to budget.
         self.assertEqual(
@@ -535,7 +543,7 @@ class TestCompactInvariants(unittest.TestCase):
 
     def test_wrong_length_raises(self):
         with self.assertRaises(AssertionError):
-            self.comp._compact_request(
+            self.comp._prepare_compaction(
                 self.state, self.seq_len, torch.tensor([0, 2, 5])  # 3 != budget 4
             )
         self._assert_no_mutation()
@@ -543,7 +551,7 @@ class TestCompactInvariants(unittest.TestCase):
     def test_non_ascending_raises(self):
         with self.assertRaises(AssertionError):
             # descending / unsorted kept indices
-            self.comp._compact_request(
+            self.comp._prepare_compaction(
                 self.state, self.seq_len, torch.tensor([3, 1, 4, 5])
             )
         self._assert_no_mutation()
@@ -551,7 +559,7 @@ class TestCompactInvariants(unittest.TestCase):
     def test_duplicate_index_raises(self):
         with self.assertRaises(AssertionError):
             # 4 appears twice -> not strictly ascending AND duplicate slot
-            self.comp._compact_request(
+            self.comp._prepare_compaction(
                 self.state, self.seq_len, torch.tensor([1, 4, 4, 5])
             )
         self._assert_no_mutation()
@@ -559,14 +567,16 @@ class TestCompactInvariants(unittest.TestCase):
     def test_out_of_range_raises(self):
         with self.assertRaises(AssertionError):
             # index 6 >= seq_len 6
-            self.comp._compact_request(
+            self.comp._prepare_compaction(
                 self.state, self.seq_len, torch.tensor([0, 2, 4, 6])
             )
         self._assert_no_mutation()
 
     def test_valid_kept_still_compacts(self):
         # Sanity: a valid ascending, in-range, budget-sized kept set proceeds.
-        self.comp._compact_request(self.state, self.seq_len, torch.tensor([0, 2, 4, 5]))
+        _prepare_and_commit(
+            self.comp, self.state, self.seq_len, torch.tensor([0, 2, 4, 5])
+        )
         self.assertEqual(len(self.alloc.freed), 1)
 
 

@@ -38,8 +38,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.rkv.algo import R1KV
@@ -52,6 +53,25 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids heavy imports
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
+
+class _CompactionCommit(msgspec.Struct):
+    """One prepared compaction awaiting the scheduler-synced commit.
+
+    Emitted by the forward-side *prepare* phase (``_prepare_compaction``), after
+    the surviving K/V has already been relocated to the front ``budget`` slots.
+    The scheduler drains these after the forward (``commit_compactions``) to free
+    the tail slots and finalize the request bookkeeping, so the allocator is
+    mutated only at a point where the forward stream is synced — not from inside
+    the forward. ``freed_slots`` is a device tensor and ``req`` a duck-typed
+    ``Req``; this struct is an in-process container only (never serialized).
+    """
+
+    req_pool_idx: int
+    budget: int
+    seq_len: int
+    freed_slots: Any
+    req: Any
 
 
 @dataclass
@@ -172,6 +192,11 @@ class RKVCompressor:
         self.states: Dict[int, RKVRequestState] = {}
         # req_pool_idx values that armed a compaction this forward pass.
         self._armed: set[int] = set()
+        # Two-phase compaction: the forward-side prepare phase relocates K/V and
+        # appends a commit record here; the scheduler drains it after the forward
+        # (``commit_compactions``) to free slots + finalize bookkeeping, keeping
+        # allocator mutation out of the forward stream.
+        self._pending_commits: List[_CompactionCommit] = []
         # req_pool_idx -> new physical KV length after the latest compaction.
         # The scheduler drains this (``take_pending_length_updates``) to update
         # the batch-level seq_lens tensors, which it owns.
@@ -486,15 +511,19 @@ class RKVCompressor:
         return acc
 
     # ------------------------------------------------------------------
-    # Compaction (called once after the full forward pass)
+    # Compaction (prepare in the forward, commit at a scheduler-synced point)
     # ------------------------------------------------------------------
     def maybe_compact(self, forward_batch: ForwardBatch) -> None:
-        """Run physical compaction for any request armed this forward pass.
+        """Prepare physical compaction for any request armed this forward pass.
 
-        Scoring is batched across all layers here (see ``_batched_scores``). On
-        the first compaction an A/B gate compares the batched kept-set against
-        the per-layer reference; if they differ it falls back to the per-layer
-        path permanently (protecting accuracy).
+        This is the **prepare** phase, run at the end of the decode forward: it
+        scores each armed request and relocates its surviving K/V to the front
+        ``budget`` slots (forward-stream compute), then appends a commit record
+        to ``_pending_commits``. The allocator free + request bookkeeping is
+        deferred to ``commit_compactions`` (called by the scheduler after the
+        forward), so allocator state is never mutated from inside the forward
+        stream. Scoring is batched across all layers (see ``_batched_scores``);
+        the first compaction runs an A/B gate against the per-layer reference.
         """
         if not self._armed:
             return
@@ -541,9 +570,24 @@ class RKVCompressor:
                 )
                 kept = self._assemble_kept(score, seq_len)
 
-            self._compact_request(state, seq_len, kept)
+            self._pending_commits.append(self._prepare_compaction(state, seq_len, kept))
 
         self._armed.clear()
+
+    def commit_compactions(self) -> None:
+        """Commit phase: apply every prepared compaction.
+
+        The scheduler calls this after the decode forward has completed (a
+        stream-synced point), *before* it releases any finished request's KV, so
+        the tail free + ``req_to_token`` clear land before ``release_kv_cache``
+        (no double-free) and the allocator is mutated with the forward stream
+        idle. No-op when nothing was prepared.
+        """
+        if not self._pending_commits:
+            return
+        for plan in self._pending_commits:
+            self._commit_compaction(plan)
+        self._pending_commits.clear()
 
     def _assemble_kept(self, score_accum: torch.Tensor, seq_len: int) -> torch.Tensor:
         """Global kept-token indices: top past tokens + trailing window.
@@ -561,14 +605,15 @@ class RKVCompressor:
         kept = torch.cat([past_idx, window_idx])
         return torch.sort(kept).values
 
-    def _compact_request(
+    def _prepare_compaction(
         self, state: RKVRequestState, seq_len: int, kept_local: torch.Tensor
-    ) -> None:
-        """Physically compact one request's KV cache (page_size == 1).
-
-        Relocates surviving slots' K/V to the front ``budget`` slots for every
-        layer, frees the freed tail slots, rewrites ``req_to_token``, and clears
-        the tail. Kept indices must be ascending.
+    ) -> _CompactionCommit:
+        """Prepare phase (runs in the forward): relocate one request's surviving
+        K/V to the front ``budget`` slots for every layer (page_size == 1) and
+        return a commit record. Does NOT free slots, clear ``req_to_token``, or
+        touch request lengths — those are the scheduler-synced commit phase
+        (``_commit_compaction``), so the allocator is mutated only with the
+        forward stream idle. Kept indices must be ascending.
         """
         idx = state.req_pool_idx
         budget = self.config.budget
@@ -598,7 +643,8 @@ class RKVCompressor:
         ), "R-KV kept set maps to duplicate physical slots (would double-free)"
 
         # Relocate K/V for every layer. Clone before write so overlapping
-        # src/dst ranges don't corrupt each other.
+        # src/dst ranges don't corrupt each other. This is forward-stream compute
+        # on the KV buffers; it does NOT touch the allocator.
         for layer_id in range(self.start_layer, self.end_layer):
             k_buffer = self.token_to_kv_pool.get_key_buffer(layer_id)
             v_buffer = self.token_to_kv_pool.get_value_buffer(layer_id)
@@ -607,16 +653,42 @@ class RKVCompressor:
             k_buffer[dst] = k_keep
             v_buffer[dst] = v_keep
 
-        # Free the tail slots (page_size == 1 => per-slot free).
-        freed = slots[budget:seq_len]
-        if freed.numel() > 0:
-            self.kv_allocator.free(freed.to(r2t.dtype))
-
-        # req_to_token[:budget] already equals ``dst`` (same physical slots),
-        # now holding the relocated kept KV in temporal order. Clear the tail.
-        r2t[idx, budget:seq_len] = 0
-
+        # Reset the trigger counter now (compressor-local state, not allocator).
         state.steps_since_compact = 0
+
+        # The tail slots [budget, seq_len) are the survivors' old homes plus the
+        # evicted tokens; they are freed in the commit phase. ``slots`` is a
+        # clone, so this stays valid after req_to_token is cleared at commit.
+        freed = slots[budget:seq_len].to(r2t.dtype)
+        return _CompactionCommit(
+            req_pool_idx=idx,
+            budget=budget,
+            seq_len=seq_len,
+            freed_slots=freed,
+            req=state.req,
+        )
+
+    def _commit_compaction(self, plan: _CompactionCommit) -> None:
+        """Commit phase (scheduler-synced): free the tail slots, clear the
+        ``req_to_token`` tail, and shrink the request's physical length.
+
+        Runs after the forward at a stream-synced scheduler point, so the
+        allocator free never races the forward. ``req_to_token[:budget]`` already
+        holds the relocated kept KV (written in the prepare phase); here we only
+        release the tail the survivors vacated.
+        """
+        idx = plan.req_pool_idx
+        budget = plan.budget
+        seq_len = plan.seq_len
+        r2t = self.req_to_token_pool.req_to_token
+
+        # Free the tail slots (page_size == 1 => per-slot free).
+        if plan.freed_slots.numel() > 0:
+            self.kv_allocator.free(plan.freed_slots)
+
+        # req_to_token[:budget] already equals the relocated kept KV in temporal
+        # order. Clear the tail.
+        r2t[idx, budget:seq_len] = 0
 
         # Physical-length bookkeeping. The scheduler normally treats seq_lens as
         # BOTH the physical KV length AND the rotary position source; R-KV breaks
@@ -624,13 +696,13 @@ class RKVCompressor:
         # owning request here (same process, shared pools), and expose the new
         # length via ``pending_length_updates`` so the scheduler can update its
         # batch-level seq_lens / seq_lens_cpu tensors. Rotary positions stay
-        # *logical* and are supplied separately via ``logical_position`` (see the
-        # wiring notes at the bottom of the file). ``next_position`` is
-        # intentionally NOT rewound: future tokens keep their absolute positions
-        # so their rotary stays consistent with the retained keys.
-        if state.req is not None:
-            state.req.kv_committed_len = budget
-            state.req.kv_allocated_len = budget
+        # *logical* and are supplied separately via ``logical_position``.
+        # ``next_position`` is intentionally NOT rewound: future tokens keep
+        # their absolute positions so their rotary stays consistent with the
+        # retained keys.
+        if plan.req is not None:
+            plan.req.kv_committed_len = budget
+            plan.req.kv_allocated_len = budget
         self.pending_length_updates[idx] = budget
 
         logger.info(
@@ -638,7 +710,7 @@ class RKVCompressor:
             idx,
             seq_len,
             budget,
-            freed.numel(),
+            plan.freed_slots.numel(),
         )
 
     # ------------------------------------------------------------------
@@ -713,9 +785,13 @@ class RKVCompressor:
 #   1. FlashInferAttnBackend.forward_decode: after set_kv_buffer, call
 #      compressor.collect_decode_query(q, layer, forward_batch) (in-graph).
 #   2. model_runner (or the backend's end-of-forward hook): after the full
-#      decode forward pass, call compressor.maybe_compact(forward_batch), then
-#      have the scheduler apply take_pending_length_updates() to batch.seq_lens
-#      / seq_lens_cpu (kv_committed_len / kv_allocated_len are already updated).
+#      decode forward pass, call compressor.maybe_compact(forward_batch) (the
+#      PREPARE phase — relocates surviving K/V, queues commit records). The
+#      scheduler then, after the forward has completed, calls
+#      compressor.commit_compactions() (the COMMIT phase — frees the evicted
+#      tail slots off the forward stream) and applies take_pending_length_updates()
+#      to batch.seq_lens / seq_lens_cpu (kv_committed_len / kv_allocated_len are
+#      updated in the commit phase).
 #   3. scheduler / schedule_batch: call on_request_begin / on_request_end around
 #      a request's life; disable overlap scheduling for phase 1 (simpler timing).
 #   4. ForwardBatch construction (forward_batch_info): for R-KV-managed requests
