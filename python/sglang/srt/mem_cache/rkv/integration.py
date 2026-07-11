@@ -55,6 +55,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids heavy imports
 logger = logging.getLogger(__name__)
 
 
+# Cap on the batched-scoring transient (cosine matrix + mask + indices) per
+# compaction. Because compactions run sequentially (one armed request at a time
+# in ``maybe_compact``), this is also the per-step compaction-workspace peak the
+# KV-pool sizing reserves so a compaction never OOMs on transient tensors even
+# when the pool is full (ModelRunner._reserve_rkv_decode_aux_bytes).
+RKV_SCORE_CHUNK_BYTES: int = 512 << 20
+
+
 class _CompactionCommit(msgspec.Struct):
     """One prepared compaction awaiting the scheduler-synced commit.
 
@@ -206,8 +214,10 @@ class RKVCompressor:
         # = they differed on the first compaction (per-layer fallback forever).
         self._batched_ok: Optional[bool] = None
         # Cap the batched-scoring transient (cosine matrix + mask + indices) so
-        # peak memory stays bounded when budget (=> seq_len) is large.
-        self._score_chunk_bytes: int = 512 << 20
+        # peak memory stays bounded when budget (=> seq_len) is large. This is
+        # also the per-request compaction-workspace bound the KV-pool sizing
+        # reserves (ModelRunner._reserve_rkv_decode_aux_bytes).
+        self._score_chunk_bytes: int = RKV_SCORE_CHUNK_BYTES
 
         # --- (1c) in-graph decode query collection ---
         # Rolling per-layer observation-window buffer, keyed by req_pool_idx (so

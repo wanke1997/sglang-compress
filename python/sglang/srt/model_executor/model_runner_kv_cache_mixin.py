@@ -1124,7 +1124,7 @@ class ModelRunnerKVCacheMixin:
             )
 
         q_head_num = self.model_config.get_num_attention_heads(self.tp_size)
-        aux_bytes = self._rkv_rolling_q_bytes(
+        rolling_bytes = self._rkv_rolling_q_bytes(
             num_layers=self.num_effective_layers,
             window_size=window_size,
             num_rows=num_rows,
@@ -1133,33 +1133,49 @@ class ModelRunnerKVCacheMixin:
             elem_size=torch._utils._element_size(self.model_config.dtype),
         )
 
+        # Compaction workspace: the transient scoring tensors (cosine matrix +
+        # gathered keys) and relocation clones a compaction allocates. Because
+        # compactions run sequentially (one request at a time in maybe_compact),
+        # the peak is a single request's workspace, capped by the score-chunk
+        # bound; reserve it (+25% for the first-compaction A/B gate and caching-
+        # allocator retention) so a compaction never OOMs on transients when the
+        # KV pool is full — the KV-slot admission accounting does not cover it.
+        from sglang.srt.mem_cache.rkv.integration import RKV_SCORE_CHUNK_BYTES
+
+        workspace_bytes = RKV_SCORE_CHUNK_BYTES + (RKV_SCORE_CHUNK_BYTES >> 2)
+        aux_bytes = rolling_bytes + workspace_bytes
+
         reduced = available_bytes - aux_bytes
         min_keep = getattr(configurator, "_cell_size", 0) or (1 << 20)
         if reduced < min_keep:
             logger.warning(
-                "R-KV decode rolling-query buffer (%.2f GiB) is too large for the "
-                "KV budget (%.2f GiB); clamping its reservation. Lower "
-                "--max-running-requests or --rkv-window-size.",
-                aux_bytes / (1 << 30),
+                "R-KV decode aux memory (%.2f GiB rolling-query + %.2f GiB "
+                "compaction workspace) is too large for the KV budget (%.2f "
+                "GiB); clamping its reservation. Lower --max-running-requests "
+                "or --rkv-window-size.",
+                rolling_bytes / (1 << 30),
+                workspace_bytes / (1 << 30),
                 available_bytes / (1 << 30),
             )
             reduced = min_keep
         logger.info(
-            "R-KV decode: reserving %.2f GiB for the rolling-query buffer "
-            "(%d rows x %d layers x window %d x %d heads x %d dim); "
-            "KV budget %.2f -> %.2f GiB.",
+            "R-KV decode: reserving %.2f GiB (%.2f GiB rolling-query buffer, "
+            "%d rows x %d layers x window %d x %d heads x %d dim; + %.2f GiB "
+            "compaction workspace); KV budget %.2f -> %.2f GiB.",
             aux_bytes / (1 << 30),
+            rolling_bytes / (1 << 30),
             num_rows,
             self.num_effective_layers,
             window_size,
             q_head_num,
             self.model_config.head_dim,
+            workspace_bytes / (1 << 30),
             available_bytes / (1 << 30),
             reduced / (1 << 30),
         )
         if getattr(
             self.server_args, "rkv_max_active_requests", None
-        ) is None and aux_bytes >= (1 << 30):
+        ) is None and rolling_bytes >= (1 << 30):
             logger.info(
                 "R-KV: the rolling-query buffer is %.2f GiB (%d concurrent "
                 "requests). Set --rkv-max-active-requests to cap concurrency and "
