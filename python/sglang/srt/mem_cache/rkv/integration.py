@@ -177,6 +177,7 @@ class RKVCompressor:
         q_head_num: int,
         head_dim: int,
         q_dtype: torch.dtype,
+        fused_validation: str = "first-request",
     ) -> None:
         self.config = config
         self.req_to_token_pool = req_to_token_pool
@@ -194,6 +195,18 @@ class RKVCompressor:
             mix_lambda=config.mix_lambda,
             retain_ratio=config.retain_ratio,
             retain_direction=config.retain_direction,
+            fused_validation=fused_validation,
+        )
+        # Startup fused-kernel validation (no-op unless fused_validation ==
+        # "startup"): warm the fused-vs-reference gate now, using the real KV
+        # head count / dtype, so the first real compaction pays no gate cost.
+        k0 = self.token_to_kv_pool.get_key_buffer(self.start_layer)
+        self.algo.warmup_fused_kernel(
+            kv_heads=k0.shape[1],
+            head_dim=head_dim,
+            device=device,
+            dtype=k0.dtype,
+            seq_len=config.budget,
         )
 
         # Active per-request state, keyed by req_pool_idx.

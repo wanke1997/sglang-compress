@@ -1894,6 +1894,17 @@ class ServerArgs:
         "peak decode concurrency for memory; leave unset to keep the auto-resolved "
         "max_running_requests.",
     ] = None
+    rkv_fused_validation: A[
+        str,
+        Arg(
+            help="R-KV: when to validate the fused Triton redundancy kernel against "
+            "the reference. 'startup' validates once at load with a synthetic tensor "
+            "(no first-request cost); 'first-request' validates lazily on the first "
+            "real compaction; 'off' never uses the fused kernel (always reference). "
+            "Applies to both --enable-rkv and --enable-rkv-prefill.",
+            choices=["startup", "first-request", "off"],
+        ),
+    ] = "startup"
 
     # -------------------------------------------------------------------------
     # R-KV prefill (prompt-phase KV compression using R-KV importance+redundancy)

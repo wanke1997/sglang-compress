@@ -887,6 +887,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 q_head_num=self.model_config.get_num_attention_heads(self.tp_size),
                 head_dim=self.model_config.head_dim,
                 q_dtype=self.model_config.dtype,
+                fused_validation=sa.rkv_fused_validation,
             )
 
         if self.enable_rkv_prefill:
@@ -911,6 +912,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 end_layer=self.start_layer + self.num_effective_layers,
                 device=self.device,
                 enable_overlap=not self.server_args.disable_overlap_schedule,
+                fused_validation=self.server_args.rkv_fused_validation,
             )
 
         self.init_routed_experts_capturer()

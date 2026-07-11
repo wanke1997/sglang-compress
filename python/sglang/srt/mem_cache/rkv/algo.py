@@ -151,6 +151,7 @@ class R1KV:
         mix_lambda=0.07,
         retain_ratio=0.1,
         retain_direction="last",
+        fused_validation="first-request",
         **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
@@ -162,6 +163,35 @@ class R1KV:
         self.retain_direction = retain_direction
         # Fused redundancy backend: None=untried, False=reference fallback, else fn.
         self._fused_redundancy = None
+        # Fused-kernel adoption policy: "off" (never use the fused kernel),
+        # "startup" (validate once with a synthetic tensor via
+        # warmup_fused_kernel, so the first real compaction pays no gate cost),
+        # or "first-request" (lazy — validate on the first real compaction).
+        self._fused_validation = fused_validation
+        if fused_validation == "off":
+            self._fused_redundancy = False
+
+    def warmup_fused_kernel(self, kv_heads, head_dim, device, dtype, seq_len=None):
+        """Startup validation of the fused redundancy kernel.
+
+        Runs the fused-vs-reference A/B gate once on a synthetic key tensor so
+        the first real compaction does not pay the gate cost, and a broken /
+        unavailable kernel is caught at startup instead of on a user's first
+        (possibly long) request. No-op unless ``fused_validation == "startup"``,
+        ``retain_direction == "last"``, and the device is CUDA; the adoption
+        decision it latches uses the real model's ``kv_heads`` / ``head_dim`` /
+        ``dtype``, which is what the kernel's correctness depends on.
+        """
+        if self._fused_validation != "startup":
+            return
+        dev = torch.device(device)
+        if self.retain_direction != "last" or dev.type != "cuda":
+            return
+        if self._fused_redundancy is not None:  # already decided (e.g. "off")
+            return
+        n = int(seq_len or max(self.budget, self.window_size + 1))
+        keys = torch.randn((1, kv_heads, n, head_dim), device=dev, dtype=dtype)
+        self._redundancy(keys)  # triggers the lazy gate, latches the decision
 
     def _scores(self, key_states, query_states):
         """Compute the per-past-token joint R-KV score.

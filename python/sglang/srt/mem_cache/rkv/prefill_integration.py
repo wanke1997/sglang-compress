@@ -115,6 +115,7 @@ class RKVPrefillCompressor:
         end_layer: int,
         device: torch.device,
         enable_overlap: bool = False,
+        fused_validation: str = "first-request",
     ) -> None:
         self.config = config
         self.req_to_token_pool = req_to_token_pool
@@ -137,6 +138,18 @@ class RKVPrefillCompressor:
             retain_ratio=config.retain_ratio,
             sim_threshold=config.sim_threshold,
             row_block=config.row_block,
+            fused_validation=fused_validation,
+        )
+        # Startup fused-kernel validation (no-op unless fused_validation ==
+        # "startup"): warm the fused-vs-tiled gate now with the real KV head
+        # count / dtype so the first real prompt compaction pays no gate cost.
+        k0 = self.token_to_kv_pool.get_key_buffer(self.start_layer)
+        self.algo.warmup_fused_kernel(
+            kv_heads=k0.shape[1],
+            head_dim=k0.shape[-1],
+            device=device,
+            dtype=k0.dtype,
+            seq_len=config.budget,
         )
 
         self.states: Dict[int, RKVPrefillRequestState] = {}

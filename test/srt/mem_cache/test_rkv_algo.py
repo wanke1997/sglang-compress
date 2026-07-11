@@ -314,5 +314,27 @@ class TestRKVAlgoParity(unittest.TestCase):
                 self.assertTrue(window.issubset(kept))
 
 
+class TestFusedValidationMode(unittest.TestCase):
+    """R4: the --rkv-fused-validation policy latched on R1KV construction."""
+
+    def test_off_forces_reference(self):
+        algo = R1KV(budget=64, window_size=8, fused_validation="off")
+        # "off" latches the reference fallback immediately (never uses fused).
+        self.assertIs(algo._fused_redundancy, False)
+
+    def test_default_is_lazy(self):
+        algo = R1KV(budget=64, window_size=8)  # default "first-request"
+        self.assertIsNone(algo._fused_redundancy)
+
+    def test_warmup_is_noop_on_cpu(self):
+        # startup warmup must not crash and must no-op off CUDA (the tests are
+        # CPU-only); the decision stays lazy for the CPU reference path.
+        algo = R1KV(budget=64, window_size=8, fused_validation="startup")
+        algo.warmup_fused_kernel(
+            kv_heads=2, head_dim=16, device="cpu", dtype=torch.float32
+        )
+        self.assertIsNone(algo._fused_redundancy)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

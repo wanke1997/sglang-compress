@@ -189,6 +189,7 @@ class RKVPrefill:
         retain_direction: str = "last",
         sim_threshold: float = 0.5,
         row_block: int = 2048,
+        fused_validation: str = "first-request",
     ) -> None:
         assert budget > window_size, "budget must exceed window_size"
         self.budget = budget
@@ -201,6 +202,31 @@ class RKVPrefill:
         self.row_block = row_block
         # Fused redundancy backend: None=untried, False=tiled fallback, else fn.
         self._fused_redundancy = None
+        # Fused-kernel adoption policy: "off" (never use the fused kernel),
+        # "startup" (validate once via warmup_fused_kernel), or "first-request"
+        # (lazy — validate on the first real prompt compaction).
+        self._fused_validation = fused_validation
+        if fused_validation == "off":
+            self._fused_redundancy = False
+
+    def warmup_fused_kernel(self, kv_heads, head_dim, device, dtype, seq_len=None):
+        """Startup validation of the fused redundancy kernel (prefill).
+
+        Runs the fused-vs-tiled A/B gate once on a synthetic key tensor so the
+        first (possibly long) real prompt compaction pays no gate cost and a
+        broken kernel is caught at startup. No-op unless ``fused_validation ==
+        "startup"``, ``retain_direction == "last"``, and the device is CUDA.
+        """
+        if self._fused_validation != "startup":
+            return
+        dev = torch.device(device)
+        if self.retain_direction != "last" or dev.type != "cuda":
+            return
+        if self._fused_redundancy is not None:  # already decided (e.g. "off")
+            return
+        n = int(seq_len or max(self.budget, self.window_size + 1))
+        keys = torch.randn((1, kv_heads, n, head_dim), device=dev, dtype=dtype)
+        self._redundancy_full(keys)  # triggers the lazy gate, latches the decision
 
     # ------------------------------------------------------------------
     # Per-layer scoring (heads reduced by mean -> one score per past token)
