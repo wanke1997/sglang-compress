@@ -102,15 +102,23 @@ gives ~0% benefit on long prompts anyway (compute-bound).
 
 ### P1 — Optimize R-KV-prefill's O(n²) prefill scoring  ← highest value
 
-> **Update (2026-07-11): partly done.** Per-layer scoring is now **batched across
-> layers** (one `batched_past_score` call instead of `num_layers` GEMMs) for both
-> prefill and decode — 8× on a 2174-token prompt (94.4 ms → 11.9 ms). The items
-> below are the *remaining* work on top of that batched baseline.
+> **Update (2026-07-11): partly done, but workload-dependent.** Per-layer scoring
+> is now **batched across layers** (one `batched_past_score` call instead of
+> `num_layers` GEMMs) for both prefill and decode. The gain depends on sequence
+> length: **8× on a 2174-token prompt** (94.4 ms → 11.9 ms, launch-overhead-bound),
+> but **perf-neutral on the 8–23K-token summarization workload** — there the
+> per-layer O(n²) redundancy *compute* dominates, not the layer-loop launch
+> overhead (msrv budget-4096 A/B on 8×H100: batched ≈ pre-batched, R-KV(A) 537 vs
+> 556, R-KV(B) 586 vs 592 tok/s). So batching removed the layer-loop overhead but
+> **not** the O(n²) cost. The items below (which reduce that compute) are the
+> *remaining*, higher-leverage work.
 
 This is still a bottleneck: it is why R-KV-prefill only ties Full KV at 5k
-(instead of winning), and why its per-request latency was higher (11.2s vs 9.4s
-at 20k — measured pre-batching; likely narrower now). Killing the rest lets R-KV's
-*quality* edge (redundancy term) also translate into throughput/latency wins.
+(instead of winning), and why its per-request latency is higher (11.2s vs 9.4s
+at 20k — batched scoring did **not** narrow this on long prompts, per the msrv
+A/B above; the O(n²) compute, not the layer loop, is what remains). Killing the
+rest lets R-KV's *quality* edge (redundancy term) also translate into
+throughput/latency wins.
 - **P1a. Cross-layer subsampling** — on top of the batched pass, score only K of N
   layers (a further compute ÷ N/K). Easy, high impact. Validate accuracy A/B
   (subsampled vs all-layers keep-set Jaccard + judge accuracy) before/after.
