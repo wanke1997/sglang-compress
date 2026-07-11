@@ -196,6 +196,19 @@ class R1KV:
         return final_score
 
     def _reference_redundancy(self, key_states):
+        # Reference redundancy for the fused-kernel smoke gate. On CUDA use the
+        # O(n)-memory tiled implementation: the full n x n matrix built by
+        # ``cal_similarity`` OOMs on long sequences (e.g. decode-mode compaction
+        # of a long prompt, where n = prompt length). ``cal_similarity_tiled`` is
+        # bit-parity with ``cal_similarity`` for ``retain_direction="last"``. On
+        # CPU (small test tensors, and no serving package on the import path) the
+        # full-matrix reference is fine.
+        if self.retain_direction == "last" and key_states.is_cuda:
+            from sglang.srt.mem_cache.rkv.prefill import cal_similarity_tiled
+
+            return cal_similarity_tiled(
+                key_states, threshold=0.5, retain_direction="last"
+            )
         return cal_similarity(
             key_states,
             retain_ratio=self.retain_ratio,
