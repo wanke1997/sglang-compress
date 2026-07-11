@@ -788,16 +788,27 @@ class RKVCompressor:
         """
         if forward_batch.positions is None:
             return
-        req_indices = forward_batch.req_pool_indices
-        for i in range(req_indices.shape[0]):
-            st = self.states.get(int(req_indices[i].item()))
+        # One GPU->CPU sync for the whole batch (tolist) instead of a .item()
+        # per request each decode step; collect the logical overrides and apply
+        # them in a single batched scatter rather than an element write per req.
+        req_indices = forward_batch.req_pool_indices.tolist()
+        rows: List[int] = []
+        values: List[int] = []
+        for i, req_pool_idx in enumerate(req_indices):
+            st = self.states.get(int(req_pool_idx))
             if st is not None and st.req is not None:
                 # logical_position() counts all tokens seen so far INCLUDING the
                 # token being decoded this step (it was appended to output_ids
                 # when it was sampled), so the current token's 0-based rotary
                 # position is that count minus one — for an un-compacted request
                 # this equals the baseline clamp_position(seq_lens) = seq_lens-1.
-                forward_batch.positions[i] = self.logical_position(st.req) - 1
+                rows.append(i)
+                values.append(self.logical_position(st.req) - 1)
+        if rows:
+            positions = forward_batch.positions
+            idx = torch.tensor(rows, device=positions.device, dtype=torch.long)
+            val = torch.tensor(values, device=positions.device, dtype=positions.dtype)
+            positions[idx] = val
 
 
 # ---------------------------------------------------------------------------

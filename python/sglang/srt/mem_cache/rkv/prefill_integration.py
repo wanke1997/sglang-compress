@@ -162,6 +162,10 @@ class RKVPrefillCompressor:
         # Cap the batched-scoring transient so peak memory stays bounded for long
         # prompts (the tiled cosine block dominates).
         self._score_chunk_bytes: int = 512 << 20
+        # Per-forward host-side batch metadata (req_pool_indices, seq_lens,
+        # extend_lens), computed once on the first layer of each prefill forward
+        # and reused across its layers to avoid a GPU->CPU sync per layer.
+        self._prefill_meta: Optional[tuple] = None
 
     # ------------------------------------------------------------------
     # Request lifecycle
@@ -238,11 +242,22 @@ class RKVPrefillCompressor:
         ``extend_seq_lens`` / ``seq_lens``.
         """
         layer_idx = layer.layer_id - self.start_layer
-        req_indices = forward_batch.req_pool_indices.tolist()
-        seq_lens = self._to_list(forward_batch.seq_lens_cpu, forward_batch.seq_lens)
-        extend_lens = self._to_list(
-            forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens
-        )
+        # req_pool_indices.tolist() is a GPU->CPU sync; the host-side batch
+        # metadata is identical for every layer of this prefill forward, so
+        # compute it ONCE on the first layer and reuse it for the rest (saves
+        # num_layers-1 syncs per prefill). forward_extend calls the layers in
+        # ascending order and R-KV runs with start_layer == 0 (tp == 1, no PP),
+        # so layer_idx == 0 is the first call of each forward and refreshes the
+        # cache — no staleness across forwards.
+        if layer_idx == 0 or self._prefill_meta is None:
+            self._prefill_meta = (
+                forward_batch.req_pool_indices.tolist(),
+                self._to_list(forward_batch.seq_lens_cpu, forward_batch.seq_lens),
+                self._to_list(
+                    forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens
+                ),
+            )
+        req_indices, seq_lens, extend_lens = self._prefill_meta
         if extend_lens is None:
             return
 
@@ -607,12 +622,22 @@ class RKVPrefillCompressor:
     def override_decode_positions(self, forward_batch: ForwardBatch) -> None:
         if forward_batch.positions is None:
             return
-        req_indices = forward_batch.req_pool_indices
-        for i in range(req_indices.shape[0]):
-            st = self.states.get(int(req_indices[i].item()))
+        # One GPU->CPU sync for the whole batch (tolist) instead of a .item()
+        # per request each decode step; apply the logical overrides in a single
+        # batched scatter rather than an element write per managed request.
+        req_indices = forward_batch.req_pool_indices.tolist()
+        offset = 0 if self.enable_overlap else 1
+        rows: List[int] = []
+        values: List[int] = []
+        for i, req_pool_idx in enumerate(req_indices):
+            st = self.states.get(int(req_pool_idx))
             if st is not None and st.req is not None:
                 # Overlap delays output_ids by one token, so logical_position is
                 # already one short then; drop the -1 in that case.
-                forward_batch.positions[i] = self.logical_position(st.req) - (
-                    0 if self.enable_overlap else 1
-                )
+                rows.append(i)
+                values.append(self.logical_position(st.req) - offset)
+        if rows:
+            positions = forward_batch.positions
+            idx = torch.tensor(rows, device=positions.device, dtype=torch.long)
+            val = torch.tensor(values, device=positions.device, dtype=positions.dtype)
+            positions[idx] = val
