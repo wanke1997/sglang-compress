@@ -35,6 +35,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # msgspec: the rkv integration modules import it at module load time
+          # (msgspec.Struct commit/state records); the by-path test loader
+          # executes those modules, so it is required even for the CPU suite.
+          pip install msgspec
 
       - name: Run RKV unit tests
         run: |
