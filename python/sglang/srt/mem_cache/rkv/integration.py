@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -62,6 +62,76 @@ logger = logging.getLogger(__name__)
 # KV-pool sizing reserves so a compaction never OOMs on transient tensors even
 # when the pool is full (ModelRunner._reserve_rkv_decode_aux_bytes).
 RKV_SCORE_CHUNK_BYTES: int = 512 << 20
+
+
+# Backends into which the R-KV observation / compaction hooks are actually
+# wired. The hooks live only in the MHA FlashInfer attention backend and index
+# every layer's KV buffer with full ``req_to_token`` slots.
+_RKV_SUPPORTED_ATTENTION_BACKENDS = ("flashinfer",)
+
+
+def rkv_runtime_support_error(
+    *,
+    mode: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    use_mla: bool,
+    is_hybrid_swa: bool,
+    spec_enabled: bool,
+    page_size: Optional[int],
+) -> Optional[str]:
+    """Return a reason the *resolved* runtime cannot support R-KV, else ``None``.
+
+    ``ServerArgs._handle_rkv*_validation`` runs before the attention backend,
+    model architecture, page size, and speculative algorithm are resolved, so it
+    cannot see what is actually wired. This pure check is called from
+    ``ModelRunner`` right before the compressor is built, once everything is
+    resolved, and hard-fails any configuration whose runtime the observation /
+    compaction hooks do not cover:
+
+    * the hooks exist ONLY in the MHA FlashInfer backend (prefill observe lives
+      in ``forward_extend``; decode observe in ``forward_decode``);
+    * they index every layer buffer with full ``req_to_token`` slots, so MLA
+      (different KV layout) and hybrid-SWA (needs full->SWA slot translation)
+      pools are unsupported;
+    * speculative decoding (e.g. TARGET_VERIFY) drives extra forwards the hooks
+      do not account for;
+    * page_size must be 1 for per-slot free.
+
+    ``mode`` is ``"decode"`` or ``"prefill"`` (used only in the message).
+    """
+    if (
+        prefill_backend not in _RKV_SUPPORTED_ATTENTION_BACKENDS
+        or decode_backend not in _RKV_SUPPORTED_ATTENTION_BACKENDS
+    ):
+        return (
+            f"R-KV ({mode}) requires the FlashInfer attention backend for both "
+            f"prefill and decode (resolved prefill={prefill_backend!r}, "
+            f"decode={decode_backend!r}); the R-KV observation hooks are wired "
+            "only into FlashInferAttnBackend."
+        )
+    if use_mla:
+        return (
+            f"R-KV ({mode}) does not support MLA models: the compressor indexes "
+            "every layer's KV buffer with full req_to_token slots, which the MLA "
+            "pool layout does not provide."
+        )
+    if is_hybrid_swa:
+        return (
+            f"R-KV ({mode}) does not support hybrid sliding-window (SWA) models: "
+            "SWA layers require full-to-SWA slot translation that the compressor "
+            "does not perform (it indexes every layer with full req_to_token "
+            "slots)."
+        )
+    if spec_enabled:
+        return (
+            f"R-KV ({mode}) does not support speculative decoding: TARGET_VERIFY "
+            "and draft forwards are not wired into the observation/compaction "
+            "hooks."
+        )
+    if page_size not in (None, 1):
+        return f"R-KV ({mode}) requires page_size == 1 (per-slot free)."
+    return None
 
 
 class _CompactionCommit(msgspec.Struct):
@@ -113,6 +183,25 @@ class RKVConfig:
             self.min_seq_len = self.budget
         # Config validation raises (not assert, which -O strips) so an invalid
         # --rkv-config can never silently start a corrupting server.
+        if self.window_size <= 0:
+            raise ValueError("R-KV window_size must be a positive integer")
+        if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
+            raise ValueError(
+                "R-KV kernel_size must be a positive ODD integer: max_pool1d "
+                "with an even kernel emits n-window+1 importance values against "
+                "n-window redundancy values, which fails deterministically in "
+                "R1KV._scores"
+            )
+        if self.retain_direction not in (
+            "last",
+            "first",
+            "last_percent",
+            "first_percent",
+        ):
+            raise ValueError(
+                "R-KV retain_direction must be one of 'last' / 'first' / "
+                "'last_percent' / 'first_percent'"
+            )
         if self.budget <= self.window_size:
             raise ValueError("R-KV budget must exceed window_size")
         if self.buffer_size < self.window_size:
@@ -188,6 +277,21 @@ class RKVCompressor:
         attn_tp_group=None,
     ) -> None:
         self.config = config
+        # Serving is restricted to the memory-BOUNDED redundancy path. Only
+        # retain_direction="last" uses the fused Triton kernel / O(n)-memory
+        # tiled reference; every other direction falls back to cal_similarity,
+        # which materializes a kv_heads x n x n cosine matrix (+ mask + int64
+        # indices) that can reach many GiB and is NOT covered by the fixed
+        # compaction-workspace reservation. Reject it here rather than OOM mid
+        # serving. (The algorithm still supports other directions for offline
+        # use; only the served RKVCompressor is gated.)
+        if config.retain_direction != "last":
+            raise ValueError(
+                "R-KV serving supports only retain_direction='last' (the "
+                f"memory-bounded path); got {config.retain_direction!r}. Other "
+                "directions build an unbounded kv_heads x n x n similarity "
+                "matrix that the compaction-workspace reservation cannot cap."
+            )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.kv_allocator = kv_allocator
@@ -242,10 +346,14 @@ class RKVCompressor:
         # (``commit_compactions``) to free slots + finalize bookkeeping, keeping
         # allocator mutation out of the forward stream.
         self._pending_commits: List[_CompactionCommit] = []
-        # req_pool_idx -> new physical KV length after the latest compaction.
-        # The scheduler drains this (``take_pending_length_updates``) to update
-        # the batch-level seq_lens tensors, which it owns.
-        self.pending_length_updates: Dict[int, int] = {}
+        # req_pool_idx -> (new physical KV length, owning Req) after the latest
+        # compaction. The scheduler drains this (``take_pending_length_updates``)
+        # to update the batch-level seq_lens tensors, which it owns. The owning
+        # Req is stored so the scheduler can VALIDATE identity before applying an
+        # update: if the pool slot was released and reused between the compaction
+        # and the drain, the update belongs to a dead request and must be
+        # ignored (belt-and-braces with the clear-on-finish/retract below).
+        self.pending_length_updates: Dict[int, Tuple[int, Req]] = {}
         # Batched-scoring A/B gate: None = not yet checked, True = batched
         # selects the same kept set as the per-layer reference (adopted), False
         # = they differed on the first compaction (per-layer fallback forever).
@@ -315,9 +423,36 @@ class RKVCompressor:
         # observation window (does not inherit the previous request's cursor).
         self.step_count_of_req[req.req_pool_idx] = 0
 
+    def _clear_request_state(self, idx: int) -> bool:
+        """Drop ALL per-request R-KV bookkeeping for ``idx`` and return whether a
+        state existed.
+
+        Every finish/retract path routes through here so no stale compaction
+        artifact (pending physical-length update or armed flag) can survive the
+        release of ``idx`` and be applied to the next request that reuses the
+        same pool slot. ``_pending_commits`` is intentionally NOT touched: the
+        scheduler always drains it (``commit_compactions``) BEFORE the finish
+        loop that calls ``on_request_end``, so a queued commit is never left
+        behind; if one somehow is, the commit-path stale-plan identity guard in
+        ``_commit_compaction`` must still fire rather than be silently dropped.
+        """
+        had = self.states.pop(idx, None) is not None
+        self.pending_length_updates.pop(idx, None)
+        self._armed.discard(idx)
+        return had
+
     def on_request_end(self, req: Req) -> None:
-        """Drop a request's R-KV state when it finishes or aborts."""
-        if req.req_pool_idx is not None and self.states.pop(req.req_pool_idx, None):
+        """Drop a request's R-KV state (and any pending compaction bookkeeping)
+        when it finishes or aborts.
+
+        Clearing the pending length update / armed flag / queued commit is
+        REQUIRED, not just tidy: a request can compact and finish on the same
+        step (or finish as the last request in the batch), after which the pool
+        slot is released and reused. A leftover ``pending_length_updates`` entry
+        would then be applied to whatever request next reuses this
+        ``req_pool_idx`` in ``_apply_rkv_pre_decode``, corrupting its seq_lens.
+        """
+        if req.req_pool_idx is not None and self._clear_request_state(req.req_pool_idx):
             logger.debug(
                 "R-KV on_request_end req_pool_idx=%d states_left=%d",
                 req.req_pool_idx,
@@ -335,7 +470,7 @@ class RKVCompressor:
         while ``req.req_pool_idx`` is still valid, i.e. BEFORE the pool frees it.
         """
         if req.req_pool_idx is not None:
-            self.states.pop(req.req_pool_idx, None)
+            self._clear_request_state(req.req_pool_idx)
 
     # ------------------------------------------------------------------
     # Scheduler admission support
@@ -878,7 +1013,7 @@ class RKVCompressor:
         if plan.req is not None:
             plan.req.kv_committed_len = budget
             plan.req.kv_allocated_len = budget
-        self.pending_length_updates[idx] = budget
+        self.pending_length_updates[idx] = (budget, plan.req)
 
         logger.info(
             "R-KV compacted req_pool_idx=%d: phys %d -> %d slots (freed %d)",
@@ -917,13 +1052,14 @@ class RKVCompressor:
         """
         return len(req.origin_input_ids) + len(req.output_ids)
 
-    def take_pending_length_updates(self) -> Dict[int, int]:
-        """Return and clear the pending {req_pool_idx: new_physical_len} map.
+    def take_pending_length_updates(self) -> Dict[int, Tuple[int, Req]]:
+        """Return and clear the pending {req_pool_idx: (new_physical_len, req)} map.
 
         The scheduler calls this right after the forward pass to apply the new
         physical lengths to its batch-level seq_lens / seq_lens_cpu tensors
         (the request-level kv_committed_len / kv_allocated_len are already
-        updated in-place during compaction).
+        updated in-place during compaction). The owning Req is returned so the
+        scheduler can drop an update whose slot was reused (identity mismatch).
         """
         updates = self.pending_length_updates
         self.pending_length_updates = {}

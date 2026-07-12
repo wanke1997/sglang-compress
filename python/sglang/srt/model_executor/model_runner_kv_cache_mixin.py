@@ -1148,16 +1148,23 @@ class ModelRunnerKVCacheMixin:
         reduced = available_bytes - aux_bytes
         min_keep = getattr(configurator, "_cell_size", 0) or (1 << 20)
         if reduced < min_keep:
-            logger.warning(
-                "R-KV decode aux memory (%.2f GiB rolling-query + %.2f GiB "
-                "compaction workspace) is too large for the KV budget (%.2f "
-                "GiB); clamping its reservation. Lower --max-running-requests "
-                "or --rkv-window-size.",
-                rolling_bytes / (1 << 30),
-                workspace_bytes / (1 << 30),
-                available_bytes / (1 << 30),
+            # Do NOT clamp: shrinking the KV pool to one cell does not shrink the
+            # actual rolling_q / workspace allocation (they are sized from
+            # max_running_requests / the score-chunk bound, not the pool), so a
+            # clamp would just OOM later. Fail fast with an actionable message.
+            raise ValueError(
+                "R-KV decode aux memory (%.2f GiB rolling-query buffer + %.2f "
+                "GiB compaction workspace = %.2f GiB total) does not fit the "
+                "available KV budget (%.2f GiB). Lower --rkv-max-active-requests "
+                "or --rkv-window-size, raise --mem-fraction-static, or reduce the "
+                "model / context size."
+                % (
+                    rolling_bytes / (1 << 30),
+                    workspace_bytes / (1 << 30),
+                    aux_bytes / (1 << 30),
+                    available_bytes / (1 << 30),
+                )
             )
-            reduced = min_keep
         logger.info(
             "R-KV decode: reserving %.2f GiB (%.2f GiB rolling-query buffer, "
             "%d rows x %d layers x window %d x %d heads x %d dim; + %.2f GiB "

@@ -860,9 +860,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.mem_cache.rkv.integration import (
                 RKVCompressor,
                 RKVConfig,
+                rkv_runtime_support_error,
             )
 
             sa = self.server_args
+            # Late, post-resolution hard gate: ServerArgs validation ran before
+            # the backend/model/page-size/spec were resolved. Fail now if the
+            # actual runtime is not one the R-KV hooks are wired for.
+            _rkv_reason = rkv_runtime_support_error(
+                mode="decode",
+                prefill_backend=sa.prefill_attention_backend or sa.attention_backend,
+                decode_backend=sa.decode_attention_backend or sa.attention_backend,
+                use_mla=self.use_mla_backend,
+                is_hybrid_swa=self.is_hybrid_swa,
+                spec_enabled=not self.spec_algorithm.is_none(),
+                page_size=sa.page_size,
+            )
+            if _rkv_reason is not None:
+                raise ValueError(_rkv_reason)
             # Base config from the per-field flags; --rkv-config JSON overrides.
             rkv_cfg_dict = {
                 "budget": sa.rkv_budget,
@@ -894,11 +909,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.enable_rkv_prefill:
             import json
 
+            from sglang.srt.mem_cache.rkv.integration import (
+                rkv_runtime_support_error,
+            )
             from sglang.srt.mem_cache.rkv.prefill_integration import (
                 RKVPrefillCompressor,
                 RKVPrefillConfig,
             )
 
+            sa = self.server_args
+            _rkv_reason = rkv_runtime_support_error(
+                mode="prefill",
+                prefill_backend=sa.prefill_attention_backend or sa.attention_backend,
+                decode_backend=sa.decode_attention_backend or sa.attention_backend,
+                use_mla=self.use_mla_backend,
+                is_hybrid_swa=self.is_hybrid_swa,
+                spec_enabled=not self.spec_algorithm.is_none(),
+                page_size=sa.page_size,
+            )
+            if _rkv_reason is not None:
+                raise ValueError(_rkv_reason)
             rkv_prefill_cfg_dict = {}
             if self.server_args.rkv_prefill_config:
                 rkv_prefill_cfg_dict.update(

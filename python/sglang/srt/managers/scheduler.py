@@ -3156,11 +3156,20 @@ class Scheduler(
         if not updates:
             return
         for i, req in enumerate(batch.reqs):
-            new_len = updates.get(req.req_pool_idx)
-            if new_len is not None:
-                batch.seq_lens[i] = new_len
-                batch.seq_lens_cpu[i] = new_len
-                batch.orig_seq_lens[i] = new_len
+            upd = updates.get(req.req_pool_idx)
+            if upd is None:
+                continue
+            new_len, owner = upd
+            # Identity guard: skip an update whose pool slot was released/reused
+            # between the compaction and this drain (it belongs to a dead
+            # request). Without this a reused req_pool_idx would have the new
+            # occupant's seq_lens blindly rewritten to the old budget, letting
+            # attention read cleared/unallocated KV.
+            if owner is not req:
+                continue
+            batch.seq_lens[i] = new_len
+            batch.seq_lens_cpu[i] = new_len
+            batch.orig_seq_lens[i] = new_len
 
     def _apply_rkv_pre_decode(self, batch: ScheduleBatch):
         """Register new R-KV requests and apply the previous step's physical KV
@@ -3185,21 +3194,32 @@ class Scheduler(
         if not updates:
             return
         for i, req in enumerate(batch.reqs):
-            new_len = updates.get(req.req_pool_idx)
-            if new_len is not None:
-                # Cross-check the two length-tracking paths agree AND that this
-                # runs before prepare_for_decode: the commit set both the pending
-                # update and kv_committed_len to budget, and prepare_for_decode
-                # (which would bump kv_committed_len to budget+1) has not run yet.
-                assert new_len == req.kv_committed_len, (
+            upd = updates.get(req.req_pool_idx)
+            if upd is None:
+                continue
+            new_len, owner = upd
+            # Identity guard: a pending update whose pool slot was released and
+            # reused between commit and this drain belongs to a dead request.
+            # Skip it rather than rewrite the new occupant's seq_lens (which,
+            # under python -O with the check below stripped, would silently
+            # corrupt the reused request's length).
+            if owner is not req:
+                continue
+            # Cross-check the two length-tracking paths agree AND that this runs
+            # before prepare_for_decode: the commit set both the pending update
+            # and kv_committed_len to budget, and prepare_for_decode (which would
+            # bump kv_committed_len to budget+1) has not run yet. This is a hard
+            # invariant, so raise (not a debug assert that -O would strip).
+            if new_len != req.kv_committed_len:
+                raise RuntimeError(
                     f"R-KV length divergence for req_pool_idx={req.req_pool_idx}: "
                     f"pending update {new_len} != kv_committed_len "
                     f"{req.kv_committed_len} (compaction commit / decode-length "
                     f"ordering broken)"
                 )
-                batch.seq_lens[i] = new_len
-                batch.seq_lens_cpu[i] = new_len
-                batch.orig_seq_lens[i] = new_len
+            batch.seq_lens[i] = new_len
+            batch.seq_lens_cpu[i] = new_len
+            batch.orig_seq_lens[i] = new_len
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
