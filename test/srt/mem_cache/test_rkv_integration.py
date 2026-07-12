@@ -213,6 +213,9 @@ class TestCompactRequest(unittest.TestCase):
                 vb[s] = pattern + 0.5  # distinguish V from K
 
         self.state = RKVRequestState(req_pool_idx=self.req_pool_idx)
+        # Register the state so the commit-phase identity guard resolves it
+        # (the real flow registers via on_request_begin).
+        self.comp.states[self.req_pool_idx] = self.state
 
     def test_relocation_free_and_rewrite(self):
         # Keep past tokens {0, 2} plus the window {4, 5}. Ascending.
@@ -532,6 +535,8 @@ class TestCompactInvariants(unittest.TestCase):
             self.kv_pool.get_key_buffer(l).clone() for l in range(self.num_layers)
         ]
         self.state = RKVRequestState(req_pool_idx=self.req_pool_idx)
+        # Register the state so the commit-phase identity guard resolves it.
+        self.comp.states[self.req_pool_idx] = self.state
 
     def _assert_no_mutation(self):
         # No slot was freed and no KV buffer changed.
@@ -542,14 +547,14 @@ class TestCompactInvariants(unittest.TestCase):
             )
 
     def test_wrong_length_raises(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(RuntimeError):
             self.comp._prepare_compaction(
                 self.state, self.seq_len, torch.tensor([0, 2, 5])  # 3 != budget 4
             )
         self._assert_no_mutation()
 
     def test_non_ascending_raises(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(RuntimeError):
             # descending / unsorted kept indices
             self.comp._prepare_compaction(
                 self.state, self.seq_len, torch.tensor([3, 1, 4, 5])
@@ -557,7 +562,7 @@ class TestCompactInvariants(unittest.TestCase):
         self._assert_no_mutation()
 
     def test_duplicate_index_raises(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(RuntimeError):
             # 4 appears twice -> not strictly ascending AND duplicate slot
             self.comp._prepare_compaction(
                 self.state, self.seq_len, torch.tensor([1, 4, 4, 5])
@@ -565,10 +570,25 @@ class TestCompactInvariants(unittest.TestCase):
         self._assert_no_mutation()
 
     def test_out_of_range_raises(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(RuntimeError):
             # index 6 >= seq_len 6
             self.comp._prepare_compaction(
                 self.state, self.seq_len, torch.tensor([0, 2, 4, 6])
+            )
+        self._assert_no_mutation()
+
+    def test_duplicate_physical_slot_raises(self):
+        # Corrupt req_to_token: slot 10 appears twice. A valid ascending kept set
+        # keeps only ONE copy, so src is unique, but the freed tail would then
+        # contain slot 10 which req_to_token[:budget] still references (a
+        # use-after-free). The full-table uniqueness guard must catch this before
+        # any KV write or free.
+        self.r2t_pool.req_to_token[self.req_pool_idx, : self.seq_len] = torch.tensor(
+            [10, 11, 12, 10, 14, 15], dtype=torch.int32
+        )
+        with self.assertRaises(RuntimeError):
+            self.comp._prepare_compaction(
+                self.state, self.seq_len, torch.tensor([0, 1, 4, 5])
             )
         self._assert_no_mutation()
 
@@ -578,6 +598,140 @@ class TestCompactInvariants(unittest.TestCase):
             self.comp, self.state, self.seq_len, torch.tensor([0, 2, 4, 5])
         )
         self.assertEqual(len(self.alloc.freed), 1)
+
+
+class TestMultiRequestAndFailure(unittest.TestCase):
+    """Two-phase compaction across several requests, and its failure semantics."""
+
+    def _build(self, budget=4, window=2, seq_len=6, allocator=None):
+        device = torch.device("cpu")
+        self.num_layers, self.head_num, self.head_dim = 2, 2, 4
+        self.budget, self.window, self.seq_len = budget, window, seq_len
+        r2t = MockReqToTokenPool(8, 64, device)
+        kv = MockKVPool(
+            self.num_layers, 128, self.head_num, self.head_dim, device, torch.float32
+        )
+        alloc = allocator if allocator is not None else MockAllocator()
+        comp = RKVCompressor(
+            config=RKVConfig(budget=budget, window_size=window, buffer_size=4),
+            req_to_token_pool=r2t,
+            token_to_kv_pool=kv,
+            kv_allocator=alloc,
+            start_layer=0,
+            end_layer=self.num_layers,
+            device=device,
+            q_head_num=self.head_num,
+            head_dim=self.head_dim,
+            q_dtype=torch.float32,
+        )
+        return comp, r2t, alloc
+
+    def _register(self, comp, r2t, idx, i):
+        req = _MockReq(origin_len=20, output_len=100, req_pool_idx=idx)
+        comp.on_request_begin(req)
+        base = 10 + i * 10  # distinct physical slots per request
+        r2t.req_to_token[idx, : self.seq_len] = torch.arange(
+            base, base + self.seq_len, dtype=torch.int32
+        )
+        return req, base
+
+    def test_multiple_requests_same_step(self):
+        # 3 requests armed the same forward: all prepare, all commit, freed
+        # counts + pending lengths correct, queue drained.
+        comp, r2t, alloc = self._build()
+        reqs = {}
+        for i, idx in enumerate((1, 2, 3)):
+            req, base = self._register(comp, r2t, idx, i)
+            reqs[idx] = (req, base)
+            comp._pending_commits.append(
+                comp._prepare_compaction(
+                    comp.states[idx], self.seq_len, torch.tensor([0, 2, 4, 5])
+                )
+            )
+        self.assertEqual(len(comp._pending_commits), 3)
+
+        comp.commit_compactions()
+
+        self.assertEqual(len(alloc.freed), 3)  # one free per request
+        self.assertEqual(len(comp._pending_commits), 0)  # queue drained
+        for idx, (req, base) in reqs.items():
+            self.assertEqual(comp.pending_length_updates[idx], self.budget)
+            self.assertEqual(req.kv_committed_len, self.budget)
+            # freed = the physical tail [budget, seq_len) of THIS request
+            self.assertEqual(
+                sorted(
+                    s for f in alloc.freed for s in f.tolist() if base <= s < base + 10
+                ),
+                [base + 4, base + 5],
+            )
+
+    def test_compact_then_finish_no_double_free(self):
+        # After the commit frees the tail, a same-step finish would release the
+        # shrunk head (req_to_token[:budget]). The two freed sets must be disjoint.
+        comp, r2t, alloc = self._build()
+        req, base = self._register(comp, r2t, 1, 0)
+        comp._pending_commits.append(
+            comp._prepare_compaction(
+                comp.states[1], self.seq_len, torch.tensor([0, 2, 4, 5])
+            )
+        )
+        comp.commit_compactions()
+
+        tail_freed = set(alloc.freed[0].tolist())  # {base+4, base+5}
+        head = r2t.req_to_token[1, : req.kv_committed_len].tolist()  # retained head
+        self.assertTrue(
+            tail_freed.isdisjoint(set(head)), "tail/head overlap => double free"
+        )
+        # req_to_token tail was cleared to 0.
+        self.assertEqual(
+            r2t.req_to_token[1, self.budget : self.seq_len].tolist(), [0, 0]
+        )
+
+    def test_commit_failure_does_not_recommit(self):
+        # A mid-drain allocator failure must not re-commit the already-freed plan
+        # on a retry: commit_compactions drains _pending_commits UP FRONT.
+        class RaisingAllocator:
+            def __init__(self, raise_on):
+                self.freed = []
+                self._n = 0
+                self._raise_on = raise_on
+
+            def free(self, idx):
+                self._n += 1
+                if self._n == self._raise_on:
+                    raise RuntimeError("simulated allocator failure")
+                self.freed.append(idx.clone())
+
+        comp, r2t, alloc = self._build(allocator=RaisingAllocator(raise_on=2))
+        for i, idx in enumerate((1, 2)):
+            self._register(comp, r2t, idx, i)
+            comp._pending_commits.append(
+                comp._prepare_compaction(
+                    comp.states[idx], self.seq_len, torch.tensor([0, 2, 4, 5])
+                )
+            )
+        with self.assertRaises(RuntimeError):
+            comp.commit_compactions()
+        # First plan committed (freed once); queue drained so a retry is a no-op
+        # and cannot re-free the first plan's slots.
+        self.assertEqual(len(alloc.freed), 1)
+        self.assertEqual(len(comp._pending_commits), 0)
+        comp.commit_compactions()  # no-op
+        self.assertEqual(len(alloc.freed), 1)
+
+    def test_stale_plan_identity_raises(self):
+        # A plan whose request slot was released/reused before commit is an
+        # unrecoverable invariant break -> RuntimeError (not a silent skip).
+        comp, r2t, alloc = self._build()
+        req, _ = self._register(comp, r2t, 1, 0)
+        comp._pending_commits.append(
+            comp._prepare_compaction(
+                comp.states[1], self.seq_len, torch.tensor([0, 2, 4, 5])
+            )
+        )
+        comp.on_request_end(req)  # slot released -> state dropped
+        with self.assertRaises(RuntimeError):
+            comp.commit_compactions()
 
 
 class TestRollingQSizeContract(unittest.TestCase):

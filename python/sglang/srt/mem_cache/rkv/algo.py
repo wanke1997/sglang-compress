@@ -154,7 +154,8 @@ class R1KV:
         fused_validation="first-request",
         **kwargs,
     ):
-        assert budget - window_size > 0, "budget must be greater than window_size"
+        if budget - window_size <= 0:
+            raise ValueError("R-KV budget must be greater than window_size")
         self.budget = budget
         self.window_size = window_size
         self.kernel_size = kernel_size
@@ -257,9 +258,13 @@ class R1KV:
         if self._fused_redundancy is False:
             return self._reference_redundancy(key_states)
         if self._fused_redundancy is not None:
-            # Guard the adopted kernel: a runtime Triton compile/exec failure on
-            # an unusual shape must degrade to the reference, not crash the
-            # server (the load-time import guard only covers import, not exec).
+            # Guard the adopted kernel against SYNCHRONOUS failures (Triton
+            # compile / shape / launch errors, wrapper bugs): degrade to the
+            # reference permanently instead of crashing. Note the failure model:
+            # an ASYNCHRONOUS CUDA fault (illegal access / device-side assert)
+            # from the kernel does NOT surface here — it poisons the CUDA context
+            # and raises at a later sync point, which is (correctly) worker-fatal;
+            # we do not try to recover a poisoned context.
             try:
                 return self._fused_redundancy(key_states, threshold=0.5)
             except Exception as e:  # pragma: no cover - hardware/shape dependent

@@ -285,10 +285,12 @@ class RKVPrefill:
         if self._fused_redundancy is False:
             return self._tiled_redundancy(keys)
         if self._fused_redundancy is not None:
-            # Adopted fused kernel. Guard the call: a runtime Triton compile/exec
-            # failure on an unusual shape must degrade to the tiled reference, not
-            # crash the server (the load-time import guard in
-            # ``_get_fused_redundancy`` only covers import, not per-call exec).
+            # Adopted fused kernel. Guard against SYNCHRONOUS failures (Triton
+            # compile / shape / launch errors, wrapper bugs): degrade to the
+            # tiled reference permanently. An ASYNCHRONOUS CUDA fault (illegal
+            # access / device assert) does NOT surface here — it poisons the CUDA
+            # context and raises at a later sync point, which is (correctly)
+            # worker-fatal; we do not try to recover a poisoned context.
             try:
                 return self._fused_redundancy(keys, threshold=self.sim_threshold)
             except Exception as e:  # pragma: no cover - hardware/shape dependent

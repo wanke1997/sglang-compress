@@ -110,14 +110,20 @@ class RKVConfig:
     def __post_init__(self) -> None:
         if self.min_seq_len is None:
             self.min_seq_len = self.budget
-        assert self.budget > self.window_size, "budget must exceed window_size"
-        assert self.buffer_size >= self.window_size, (
-            "buffer_size must be >= window_size, otherwise the first compaction "
-            "scores against zero-initialized queries in the observation window"
-        )
-        assert (
-            self.min_seq_len >= self.budget
-        ), "min_seq_len must be >= budget (select_indices keeps budget tokens)"
+        # Config validation raises (not assert, which -O strips) so an invalid
+        # --rkv-config can never silently start a corrupting server.
+        if self.budget <= self.window_size:
+            raise ValueError("R-KV budget must exceed window_size")
+        if self.buffer_size < self.window_size:
+            raise ValueError(
+                "R-KV buffer_size must be >= window_size, otherwise the first "
+                "compaction scores against zero-initialized observation queries"
+            )
+        if self.min_seq_len < self.budget:
+            raise ValueError(
+                "R-KV min_seq_len must be >= budget (select_indices keeps budget "
+                "tokens)"
+            )
 
 
 class RKVRequestState:
@@ -268,8 +274,10 @@ class RKVCompressor:
         # single global cursor) so the observation window stays correct even if a
         # request skips decode steps (future preemption/pipeline/overlap): each
         # request's slots only advance on the steps it actually participates in.
-        # Row 0 (reserved padding slot) is never a real request, so its counter
-        # stays 0 and padding writes land on rolling_q row 0 harmlessly.
+        # Padding safety does NOT depend on row 0's counter value: row 0 is the
+        # reserved ReqToTokenPool padding slot (never a real request), so any
+        # padding-row write lands on rolling_q row 0 harmlessly regardless of the
+        # counter — the same reason the in-graph scatter is safe under padding.
         self.step_count_of_req = torch.zeros(
             (max_reqs,), device=device, dtype=torch.long
         )
@@ -557,24 +565,44 @@ class RKVCompressor:
         forward), so allocator state is never mutated from inside the forward
         stream. Scoring is batched across all layers (see ``_batched_scores``);
         the first compaction runs an A/B gate against the per-layer reference.
+
+        Fail-stop contract: the relocation is in-place, so a request that raises
+        mid-relocation (OOM, a validation guard, a CUDA fault) is left partially
+        moved. Any exception raised here is therefore UNRECOVERABLE — the caller
+        (ModelRunner forward) must let it propagate and terminate the worker; it
+        must NOT be caught-and-continued, or the partially-relocated request
+        would serve corrupt KV. ``_armed`` is cleared up front (below) only so a
+        *restarted* accumulator does not inherit stale arming, not to imply the
+        current worker can recover.
         """
         if not self._armed:
             return
 
         # Clear the armed set up front so a mid-loop exception (Triton failure,
-        # OOM, a kept-set assertion) cannot carry stale armed requests into the
-        # next forward. A request not prepared this pass simply re-arms later.
+        # OOM, a validation guard) cannot carry stale armed requests forward.
+        # This is fail-stop hygiene, not recovery (see the contract above).
         armed = self._armed
         self._armed = set()
 
         seq_len_by_req = self._seq_len_by_req(forward_batch)
         for req_pool_idx in list(armed):
+            # An armed request was armed from THIS forward's req_pool_indices in
+            # begin_decode_step, and no lifecycle hook runs between arming and
+            # here (same forward). So a missing state or seq_len is a genuine
+            # lifecycle desync, not an expected skip — fail fast rather than
+            # silently drop the compaction and let the request's KV grow.
             state = self.states.get(req_pool_idx)
             if state is None:
-                continue
+                raise RuntimeError(
+                    f"Armed R-KV request {req_pool_idx} has no compressor state "
+                    "(lifecycle desync between arming and compaction)"
+                )
             seq_len = seq_len_by_req.get(req_pool_idx)
             if seq_len is None:
-                continue
+                raise RuntimeError(
+                    f"Armed R-KV request {req_pool_idx} is missing from the "
+                    "ForwardBatch it was armed from"
+                )
 
             # P2: the observation-window queries now come from the in-graph
             # rolling collection (un-rotated to temporal order), not the eager
@@ -661,26 +689,42 @@ class RKVCompressor:
 
         slots = r2t[idx, :seq_len].long().clone()  # physical slots, temporal order
 
-        # Validate the kept set BEFORE mutating any buffer, so a bad score/select
-        # can never leave the request half-relocated or double-free a slot
-        # (crash-consistency: every check below is on indices only, no KV writes
-        # have happened yet). Cheap: O(budget), once per compaction.
-        assert kept_local.numel() == budget, (
-            f"R-KV kept set has {kept_local.numel()} entries, expected budget "
-            f"{budget}"
-        )
-        assert kept_local.numel() == 0 or (
-            int(kept_local.min()) >= 0 and int(kept_local.max()) < seq_len
-        ), "R-KV kept indices out of range [0, seq_len)"
-        assert bool(
-            torch.all(kept_local[1:] > kept_local[:-1])
-        ), "R-KV kept indices must be strictly ascending (unique, sorted)"
+        # Validate the kept set and the physical slot table BEFORE mutating any
+        # buffer, so a bad score/select or a corrupt req_to_token can never write
+        # KV out of bounds, relocate from a duplicate slot, or double-free (every
+        # check is on indices only — no KV writes have happened yet). These are
+        # production safety barriers, so they RAISE rather than ``assert`` (which
+        # ``python -O`` strips). Cheap: O(seq_len), once per compaction.
+        if kept_local.numel() != budget:
+            raise RuntimeError(
+                f"R-KV kept set has {kept_local.numel()} entries, expected "
+                f"budget {budget}"
+            )
+        if kept_local.numel() > 0:
+            kept_min = int(kept_local.min())
+            kept_max = int(kept_local.max())
+            if kept_min < 0 or kept_max >= seq_len:
+                raise RuntimeError(
+                    f"R-KV kept indices out of range [0, {seq_len}): "
+                    f"[{kept_min}, {kept_max}]"
+                )
+        if not bool(torch.all(kept_local[1:] > kept_local[:-1])):
+            raise RuntimeError(
+                "R-KV kept indices must be strictly ascending (unique, sorted)"
+            )
+        # The WHOLE physical slot table for this request must be a 1-to-1 map,
+        # not just the survivors: a duplicate anywhere in slots[:seq_len] could
+        # put the same slot in both the freed tail and the kept head, so commit
+        # would free a slot req_to_token still references (use-after-free).
+        # Checking the full table subsumes the survivors-unique check.
+        if slots.unique().numel() != slots.numel():
+            raise RuntimeError(
+                "R-KV req_to_token contains duplicate physical KV slots "
+                "(allocator corruption); refusing to compact"
+            )
 
         src = slots[kept_local]  # surviving physical slots (budget,)
         dst = slots[:budget]  # target front slots (budget,)
-        assert (
-            src.unique().numel() == src.numel()
-        ), "R-KV kept set maps to duplicate physical slots (would double-free)"
 
         # Relocate K/V for every layer. Clone before write so overlapping
         # src/dst ranges don't corrupt each other. This is forward-stream compute
@@ -721,6 +765,19 @@ class RKVCompressor:
         budget = plan.budget
         seq_len = plan.seq_len
         r2t = self.req_to_token_pool.req_to_token
+
+        # Stale-plan guard: if the request slot was released or reused between
+        # prepare (forward) and this commit, the tracked identity no longer
+        # matches the plan. The prepare phase already relocated this request's
+        # K/V, so a mismatch is an unrecoverable invariant break (the scheduler
+        # order guarantees commit runs before any release), NOT something to skip
+        # — fail the worker rather than free/rewrite the wrong request's slots.
+        state = self.states.get(idx)
+        if state is None or state.req is not plan.req:
+            raise RuntimeError(
+                f"Stale R-KV compaction plan for req_pool_idx={idx}: request "
+                "slot was released or reused between prepare and commit"
+            )
 
         # Free the tail slots (page_size == 1 => per-slot free).
         if plan.freed_slots.numel() > 0:

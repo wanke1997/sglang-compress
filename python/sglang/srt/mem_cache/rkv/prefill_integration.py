@@ -61,13 +61,14 @@ class RKVPrefillConfig(msgspec.Struct):
     row_block: int = 2048
 
     def __post_init__(self) -> None:
-        assert self.mode in (
-            "oneshot",
-            "buffered",
-        ), "mode must be 'oneshot' or 'buffered'"
-        assert self.budget > self.window_size, "budget must exceed window_size"
-        if self.mode == "buffered":
-            assert self.buffer >= 0, "buffer must be non-negative"
+        # Raise (not assert, which -O strips) so an invalid --rkv-prefill-config
+        # can never silently start a corrupting server.
+        if self.mode not in ("oneshot", "buffered"):
+            raise ValueError("R-KV-prefill mode must be 'oneshot' or 'buffered'")
+        if self.budget <= self.window_size:
+            raise ValueError("R-KV-prefill budget must exceed window_size")
+        if self.mode == "buffered" and self.buffer < 0:
+            raise ValueError("R-KV-prefill buffer must be non-negative")
 
 
 class RKVPrefillRequestState:

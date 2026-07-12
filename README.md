@@ -49,9 +49,11 @@ MODEL=/path/to/Qwen2.5-Math-7B-Instruct ./launch_server.sh rkv 512    # start se
 python3 eval.py --n 20 --label rkv_b512                               # run eval in another shell
 ```
 
-R-KV requires the eager decode path and the prefix cache **off**; `launch_server.sh`
-sets the required flags (`--disable-radix-cache --disable-decode-cuda-graph
---disable-overlap-schedule --page-size 1`). See
+R-KV requires the prefix cache and overlap scheduling **off** (it frees KV slots
+mid-generation); `launch_server.sh` sets the required flags
+(`--disable-radix-cache --disable-overlap-schedule --page-size 1`). The decode
+CUDA graph is **supported** (the observation-window queries are collected inside
+the captured graph), so it stays enabled. See
 [`R-KV/benchmark/README.md`](R-KV/benchmark/README.md) for details and
 [`R-KV/benchmark/RESULTS.md`](R-KV/benchmark/RESULTS.md) for the 0.5B sanity check.
 
