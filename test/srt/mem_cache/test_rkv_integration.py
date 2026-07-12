@@ -875,5 +875,115 @@ class TestPerRequestCursor(unittest.TestCase):
             self.assertNotIn(stale, wB.tolist())
 
 
+class _MockTPGroup:
+    """Duck-typed stand-in for a ``GroupCoordinator`` attention-TP group.
+
+    ``all_reduce`` here simulates the collective on a SINGLE process: the
+    default ``fn`` (``x * world_size``) models the physically-correct case where
+    every rank contributed the identical tensor (so the SUM is ``world_size``
+    times one rank's value). A custom ``fn`` lets a test simulate ranks that
+    DISAGREE, to prove the consistency check fires.
+    """
+
+    def __init__(self, world_size, fn=None):
+        self.world_size = world_size
+        self._fn = fn if fn is not None else (lambda x: x * world_size)
+        self.n_all_reduce = 0
+
+    def all_reduce(self, x):
+        self.n_all_reduce += 1
+        return self._fn(x)
+
+
+class TestTensorParallelScore(unittest.TestCase):
+    """TP: the per-token eviction score is SUMMED across the attention-TP group
+    before top-k so every rank keeps the identical tokens (which keeps the
+    replicated ``req_to_token`` consistent). Validated on CPU with a mock group:
+    uniform scaling is top-k invariant, and a divergent reduce raises loudly."""
+
+    def _compressor(self, group):
+        return RKVCompressor(
+            config=RKVConfig(budget=4, window_size=2, buffer_size=4),
+            req_to_token_pool=MockReqToTokenPool(4, 64, torch.device("cpu")),
+            token_to_kv_pool=MockKVPool(
+                1, 64, 1, 4, torch.device("cpu"), torch.float32
+            ),
+            kv_allocator=MockAllocator(),
+            start_layer=0,
+            end_layer=1,
+            device=torch.device("cpu"),
+            q_head_num=1,
+            head_dim=4,
+            q_dtype=torch.float32,
+            attn_tp_group=group,
+        )
+
+    def test_reduce_noop_without_group(self):
+        # tp==1 (no group): the reduce returns the score object unchanged.
+        comp = self._compressor(None)
+        self.assertEqual(comp.attn_tp_size, 1)
+        score = torch.tensor([0.1, 9.0, 0.2, 8.0])
+        self.assertIs(comp._reduce_score_across_tp(score), score)
+
+    def test_reduce_sums_and_preserves_topk(self):
+        # tp==2, ranks identical -> reduced score = 2 x local; top-k unchanged.
+        g = _MockTPGroup(2)
+        comp = self._compressor(g)
+        self.assertEqual(comp.attn_tp_size, 2)
+        score = torch.tensor([0.1, 9.0, 0.2, 8.0])
+        reduced = comp._reduce_score_across_tp(score)
+        self.assertEqual(g.n_all_reduce, 1)
+        self.assertTrue(torch.allclose(reduced, score.float() * 2))
+        # The kept set derived from the summed score must equal the single-rank
+        # kept set: positive uniform scaling cannot change which tokens win.
+        seq_len = 6  # past pool = 4 tokens, trailing window = 2 -> [4, 5]
+        kept_tp = comp._assemble_kept(reduced, seq_len)
+        kept_plain = comp._assemble_kept(score, seq_len)
+        self.assertTrue(torch.equal(kept_tp, kept_plain))
+
+    def test_reduce_casts_to_fp32(self):
+        # Score all-reduce is done in fp32 so ties break identically per rank.
+        g = _MockTPGroup(2)
+        comp = self._compressor(g)
+        score = torch.tensor([0.1, 9.0, 0.2, 8.0], dtype=torch.float16)
+        reduced = comp._reduce_score_across_tp(score)
+        self.assertEqual(reduced.dtype, torch.float32)
+
+    def test_consistency_check_passes_when_ranks_agree(self):
+        # Identical ranks -> SUM == local * world_size -> no raise.
+        g = _MockTPGroup(4)
+        comp = self._compressor(g)
+        comp._check_kept_consistent_across_tp(torch.tensor([1, 3, 4, 5]))
+        self.assertEqual(g.n_all_reduce, 1)
+
+    def test_consistency_check_raises_on_divergence(self):
+        # Ranks disagree: the mocked SUM != local * world_size -> loud failure.
+        g = _MockTPGroup(2, fn=lambda x: x + 1.0)
+        comp = self._compressor(g)
+        with self.assertRaises(RuntimeError):
+            comp._check_kept_consistent_across_tp(torch.tensor([1, 3, 4, 5]))
+
+    def test_consistency_check_noop_without_group(self):
+        # tp==1: no collective is issued at all.
+        comp = self._compressor(None)
+        comp._check_kept_consistent_across_tp(torch.tensor([1, 3, 4, 5]))  # no raise
+
+    def test_consistency_check_fire_schedule(self):
+        # Default (no SGLANG_RKV_TP_CHECK): self-validates only the first few
+        # compactions, then stops issuing the extra collective.
+        g = _MockTPGroup(2)
+        comp = self._compressor(g)
+        budget = comp._tp_check_remaining
+        self.assertGreater(budget, 0)
+        for _ in range(budget):
+            comp._check_kept_consistent_across_tp(torch.tensor([1, 3, 4, 5]))
+        fired = g.n_all_reduce
+        self.assertEqual(fired, budget)
+        # Past the startup budget the check no longer issues a collective.
+        for _ in range(3):
+            comp._check_kept_consistent_across_tp(torch.tensor([1, 3, 4, 5]))
+        self.assertEqual(g.n_all_reduce, fired)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

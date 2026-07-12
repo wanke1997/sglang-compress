@@ -37,6 +37,7 @@ the bottom and the roadmap in ``R-KV/doc/DESIGN.md`` section 9.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -184,6 +185,7 @@ class RKVCompressor:
         head_dim: int,
         q_dtype: torch.dtype,
         fused_validation: str = "first-request",
+        attn_tp_group=None,
     ) -> None:
         self.config = config
         self.req_to_token_pool = req_to_token_pool
@@ -193,6 +195,22 @@ class RKVCompressor:
         self.end_layer = end_layer
         self.num_layers = end_layer - start_layer
         self.device = device
+
+        # Attention-TP group. Under TP each rank holds only a SUBSET of the KV
+        # heads, so its per-token score (a cross-head mean over LOCAL heads)
+        # differs from other ranks -> different kept set -> the replicated
+        # req_to_token diverges -> silent KV corruption. We sum the per-token
+        # score across this group before top-k so every rank keeps the exact
+        # same tokens (see _reduce_score_across_tp). ``None`` / world_size==1
+        # means no TP: the reduce and check are no-ops (single-GPU unchanged).
+        self.attn_tp_group = attn_tp_group
+        self.attn_tp_size = (
+            getattr(attn_tp_group, "world_size", 1) if attn_tp_group is not None else 1
+        )
+        # TP kept-set consistency check: self-validate on the first few
+        # compactions (cheap), or every compaction when SGLANG_RKV_TP_CHECK=1.
+        self._tp_check_always = os.environ.get("SGLANG_RKV_TP_CHECK", "0") == "1"
+        self._tp_check_remaining = 8
 
         self.algo = R1KV(
             budget=config.budget,
@@ -585,7 +603,11 @@ class RKVCompressor:
         self._armed = set()
 
         seq_len_by_req = self._seq_len_by_req(forward_batch)
-        for req_pool_idx in list(armed):
+        # sorted() (not list(set)) so every attention-TP rank iterates the armed
+        # requests in the SAME order and therefore issues the per-request score
+        # all-reduces in the same order — mismatched collective order across
+        # ranks would pair the wrong tensors (silent corruption / hang).
+        for req_pool_idx in sorted(armed):
             # An armed request was armed from THIS forward's req_pool_indices in
             # begin_decode_step, and no lifecycle hook runs between arming and
             # here (same forward). So a missing state or seq_len is a genuine
@@ -612,10 +634,14 @@ class RKVCompressor:
 
             if self._batched_ok is None:
                 ref_kept = self._assemble_kept(
-                    self._reference_scores(state, seq_len), seq_len
+                    self._reduce_score_across_tp(
+                        self._reference_scores(state, seq_len)
+                    ),
+                    seq_len,
                 )
                 bat_kept = self._assemble_kept(
-                    self._batched_scores(state, seq_len), seq_len
+                    self._reduce_score_across_tp(self._batched_scores(state, seq_len)),
+                    seq_len,
                 )
                 same_shape = ref_kept.shape == bat_kept.shape
                 self._batched_ok = bool(same_shape and torch.equal(ref_kept, bat_kept))
@@ -630,13 +656,16 @@ class RKVCompressor:
                 )
                 kept = bat_kept if self._batched_ok else ref_kept
             else:
-                score = (
+                score = self._reduce_score_across_tp(
                     self._batched_scores(state, seq_len)
                     if self._batched_ok
                     else self._reference_scores(state, seq_len)
                 )
                 kept = self._assemble_kept(score, seq_len)
 
+            # Under TP, verify every rank derived the identical kept set (turns a
+            # silent cross-rank KV divergence into a loud failure).
+            self._check_kept_consistent_across_tp(kept)
             self._pending_commits.append(self._prepare_compaction(state, seq_len, kept))
 
     def commit_compactions(self) -> None:
@@ -656,6 +685,55 @@ class RKVCompressor:
         self._pending_commits = []
         for plan in plans:
             self._commit_compaction(plan)
+
+    # ------------------------------------------------------------------
+    # Tensor-parallel score agreement
+    # ------------------------------------------------------------------
+    def _reduce_score_across_tp(self, score: torch.Tensor) -> torch.Tensor:
+        """Sum the per-token eviction score across the attention-TP group.
+
+        R-KV's score is a cross-head MEAN, computed here over each rank's LOCAL
+        kv heads only; the softmax/pool inside the score are per-head, so the
+        cross-head reduction is LINEAR. Head sharding is uniform (either
+        ``num_kv_heads % tp == 0`` for distinct heads, or ``tp % num_kv_heads ==
+        0`` with uniform replication), so the all-reduced SUM equals the true
+        global cross-head mean scaled by a positive constant. ``topk`` is
+        invariant to positive scaling, so after this every rank selects the
+        IDENTICAL kept set — which is what keeps the replicated ``req_to_token``
+        consistent across ranks. No-op at tp==1 (single-GPU path unchanged).
+        """
+        if self.attn_tp_group is None or self.attn_tp_size <= 1:
+            return score
+        # fp32 all-reduce: identical across ranks (all-reduce semantics), and
+        # bounded-magnitude so ``topk`` ties break identically on every rank.
+        return self.attn_tp_group.all_reduce(score.float())
+
+    def _check_kept_consistent_across_tp(self, kept: torch.Tensor) -> None:
+        """Assert every attention-TP rank derived the identical kept set.
+
+        Turns a silent cross-rank KV divergence (the failure mode that makes TP
+        unsafe without the score all-reduce) into a loud error. Runs on the
+        first few compactions (cheap startup self-validation) or on every
+        compaction when ``SGLANG_RKV_TP_CHECK=1``. The fire schedule is a
+        function of the (rank-identical) compaction count, so the extra
+        collective is issued in lockstep across ranks.
+        """
+        if self.attn_tp_group is None or self.attn_tp_size <= 1:
+            return
+        if not self._tp_check_always:
+            if self._tp_check_remaining <= 0:
+                return
+            self._tp_check_remaining -= 1
+        # kept indices are < seq_len (<= a few 10k) and tp <= a handful, so the
+        # summed values stay exactly representable in fp32.
+        local = kept.to(torch.float32)
+        summed = self.attn_tp_group.all_reduce(local.clone())
+        if not torch.equal(summed, local * self.attn_tp_size):
+            raise RuntimeError(
+                "R-KV TP divergence: attention-TP ranks selected different kept "
+                "sets. The per-token score all-reduce is not producing identical "
+                "scores across ranks; continuing would corrupt the KV cache."
+            )
 
     def _assemble_kept(self, score_accum: torch.Tensor, seq_len: int) -> torch.Tensor:
         """Global kept-token indices: top past tokens + trailing window.

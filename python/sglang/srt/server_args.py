@@ -2997,8 +2997,15 @@ class ServerArgs:
 
         See R-KV/doc/DESIGN.md: R-KV physically frees KV slots mid-generation,
         which is incompatible with prefix caching (the radix tree would keep
-        references into freed slots), page_size > 1 (per-slot free), overlap
-        scheduling (phase 1), and TP > 1 (per-rank eviction would diverge).
+        references into freed slots), page_size > 1 (per-slot free), and overlap
+        scheduling (phase 1).
+
+        Tensor parallelism (tp > 1) IS supported: each rank scores only its local
+        KV heads, so the per-token eviction score is all-reduced across the
+        attention-TP group before top-k (RKVCompressor._reduce_score_across_tp)
+        so every rank keeps the identical tokens. DP attention is NOT supported
+        (its padded / all-gathered forward_batch layout is untested against the
+        R-KV hooks).
 
         Decode CUDA graph IS supported: a per-step hook
         (``RKVCompressor.begin_decode_step``) advances the compaction counters
@@ -3020,8 +3027,13 @@ class ServerArgs:
             )
         if self.page_size not in (None, 1):
             raise ValueError("--enable-rkv requires --page-size 1 (per-slot free).")
-        if self.tp_size > 1:
-            raise ValueError("--enable-rkv does not support tensor parallelism yet.")
+        if self.enable_dp_attention:
+            raise ValueError(
+                "--enable-rkv supports tensor parallelism (tp>1) via a cross-rank "
+                "eviction-score all-reduce, but NOT --enable-dp-attention: its "
+                "padded / all-gathered forward_batch layout is untested against "
+                "R-KV's observe / override_decode_positions / maybe_compact hooks."
+            )
         if (
             self.rkv_max_active_requests is not None
             and self.rkv_max_active_requests <= 0
@@ -3078,9 +3090,12 @@ class ServerArgs:
             raise ValueError(
                 "--enable-rkv-prefill requires --page-size 1 (per-slot free)."
             )
-        if self.tp_size > 1:
+        if self.enable_dp_attention:
             raise ValueError(
-                "--enable-rkv-prefill does not support tensor parallelism yet."
+                "--enable-rkv-prefill supports tensor parallelism (tp>1) via a "
+                "cross-rank eviction-score all-reduce, but NOT "
+                "--enable-dp-attention (its padded / all-gathered forward_batch "
+                "layout is untested against the R-KV prefill hooks)."
             )
 
     def _parse_cuda_graph_config(self):
