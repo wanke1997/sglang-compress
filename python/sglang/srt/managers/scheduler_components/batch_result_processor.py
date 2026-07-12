@@ -79,6 +79,22 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
 
+    def _rkv_on_request_finished(self, req: Req) -> None:
+        """Notify the R-KV compressors that a request finished so they drop its
+        per-request state AND any pending compaction bookkeeping.
+
+        Must be called on EVERY path that releases a finished request's pool
+        slot -- including the normal ``process_batch_result_prefill`` finish path
+        -- otherwise a request that compacts and finishes on the same step
+        leaves a stale pending length update that gets applied to the next
+        request reusing its ``req_pool_idx``.
+        """
+        model_runner = getattr(self.model_worker, "model_runner", None)
+        for attr in ("rkv_compressor", "rkv_prefill_compressor"):
+            comp = getattr(model_runner, attr, None)
+            if comp is not None:
+                comp.on_request_end(req)
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
@@ -91,20 +107,7 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                _rkv = getattr(
-                    getattr(self.model_worker, "model_runner", None),
-                    "rkv_compressor",
-                    None,
-                )
-                if _rkv is not None:
-                    _rkv.on_request_end(req)
-                _rkv_prefill = getattr(
-                    getattr(self.model_worker, "model_runner", None),
-                    "rkv_prefill_compressor",
-                    None,
-                )
-                if _rkv_prefill is not None:
-                    _rkv_prefill.on_request_end(req)
+                self._rkv_on_request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -250,6 +253,7 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        self._rkv_on_request_finished(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -883,20 +887,7 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                _rkv = getattr(
-                    getattr(self.model_worker, "model_runner", None),
-                    "rkv_compressor",
-                    None,
-                )
-                if _rkv is not None:
-                    _rkv.on_request_end(req)
-                _rkv_prefill = getattr(
-                    getattr(self.model_worker, "model_runner", None),
-                    "rkv_prefill_compressor",
-                    None,
-                )
-                if _rkv_prefill is not None:
-                    _rkv_prefill.on_request_end(req)
+                self._rkv_on_request_finished(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
                 )

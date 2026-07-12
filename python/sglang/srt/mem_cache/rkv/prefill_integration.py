@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -66,6 +66,16 @@ class RKVPrefillConfig(msgspec.Struct):
         # can never silently start a corrupting server.
         if self.mode not in ("oneshot", "buffered"):
             raise ValueError("R-KV-prefill mode must be 'oneshot' or 'buffered'")
+        if self.window_size <= 0:
+            raise ValueError("R-KV-prefill window_size must be a positive integer")
+        if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
+            raise ValueError(
+                "R-KV-prefill kernel_size must be a positive ODD integer "
+                "(an even kernel makes importance and redundancy lengths differ "
+                "by one and fails in R1KV._scores)"
+            )
+        if self.row_block <= 0:
+            raise ValueError("R-KV-prefill row_block must be a positive integer")
         if self.budget <= self.window_size:
             raise ValueError("R-KV-prefill budget must exceed window_size")
         if self.mode == "buffered" and self.buffer < 0:
@@ -168,7 +178,7 @@ class RKVPrefillCompressor:
 
         self.states: Dict[int, RKVPrefillRequestState] = {}
         self._armed: set[int] = set()
-        self.pending_length_updates: Dict[int, int] = {}
+        self.pending_length_updates: Dict[int, Tuple[int, Req]] = {}
         # Batched-scoring A/B gate: None = not yet checked, True = batched selects
         # the same past tokens as the per-layer reference (adopted), False = they
         # differed on the first compaction (per-layer fallback forever).
@@ -202,8 +212,24 @@ class RKVPrefillCompressor:
         state.prompt_len = req.seqlen
         self.states[req.req_pool_idx] = state
 
+    def _clear_request_state(self, idx: int) -> bool:
+        """Drop all per-request prefill-R-KV bookkeeping for ``idx`` and return
+        whether a state existed. Every finish/retract path routes through here so
+        no stale pending length update / armed flag survives the release of
+        ``idx`` and gets applied to the next request that reuses the pool slot.
+        """
+        had = self.states.pop(idx, None) is not None
+        self.pending_length_updates.pop(idx, None)
+        self._armed.discard(idx)
+        return had
+
     def on_request_end(self, req: Req) -> None:
-        if req.req_pool_idx is not None and self.states.pop(req.req_pool_idx, None):
+        # Clear the pending length update / armed flag here too, not just the
+        # state: a prompt-phase request can compact at prefill end and FINISH on
+        # the same step (the normal process_batch_result_prefill finish path),
+        # releasing its pool slot. A leftover pending update would then be
+        # applied to the next request reusing this req_pool_idx.
+        if req.req_pool_idx is not None and self._clear_request_state(req.req_pool_idx):
             logger.debug(
                 "R-KV-prefill on_request_end req_pool_idx=%d states_left=%d",
                 req.req_pool_idx,
@@ -221,9 +247,7 @@ class RKVPrefillCompressor:
         idx = req.req_pool_idx
         if idx is None:
             return
-        self.states.pop(idx, None)
-        self.pending_length_updates.pop(idx, None)
-        self._armed.discard(idx)
+        self._clear_request_state(idx)
 
     def admission_steady_prompt_len(self, prompt_len: int) -> int:
         """Post-compaction resident prompt length, for compression-aware admission.
@@ -632,7 +656,7 @@ class RKVPrefillCompressor:
         if state.req is not None:
             state.req.kv_committed_len = budget
             state.req.kv_allocated_len = budget
-        self.pending_length_updates[idx] = budget
+        self.pending_length_updates[idx] = (budget, state.req)
 
         logger.info(
             "R-KV-prefill(%s) compacted req_pool_idx=%d: %d -> %d (freed %d)",
@@ -668,7 +692,7 @@ class RKVPrefillCompressor:
     def logical_position(req: Req) -> int:
         return len(req.origin_input_ids) + len(req.output_ids)
 
-    def take_pending_length_updates(self) -> Dict[int, int]:
+    def take_pending_length_updates(self) -> Dict[int, Tuple[int, Req]]:
         updates = self.pending_length_updates
         self.pending_length_updates = {}
         return updates

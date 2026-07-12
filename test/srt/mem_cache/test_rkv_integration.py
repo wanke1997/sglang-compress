@@ -56,6 +56,7 @@ _integration = _load_by_path(
 RKVConfig = _integration.RKVConfig
 RKVRequestState = _integration.RKVRequestState
 RKVCompressor = _integration.RKVCompressor
+rkv_runtime_support_error = _integration.rkv_runtime_support_error
 
 
 # --------------------------------------------------------------------------- #
@@ -288,12 +289,15 @@ class TestCompactRequest(unittest.TestCase):
         # Physical length shrunk to budget on the request.
         self.assertEqual(req.kv_committed_len, self.budget)
         self.assertEqual(req.kv_allocated_len, self.budget)
-        # Pending physical-length update exposed for the scheduler, drained once.
+        # Pending physical-length update exposed for the scheduler (with the
+        # owning request for identity validation), drained once.
         self.assertEqual(
-            self.comp.pending_length_updates[self.req_pool_idx], self.budget
+            self.comp.pending_length_updates[self.req_pool_idx][0], self.budget
         )
+        self.assertIs(self.comp.pending_length_updates[self.req_pool_idx][1], req)
         drained = self.comp.take_pending_length_updates()
-        self.assertEqual(drained, {self.req_pool_idx: self.budget})
+        self.assertEqual(drained[self.req_pool_idx][0], self.budget)
+        self.assertIs(drained[self.req_pool_idx][1], req)
         self.assertEqual(self.comp.pending_length_updates, {})
 
 
@@ -446,7 +450,7 @@ class TestBatchObserve(unittest.TestCase):
 
         # Only the long request was compacted, shrunk to budget.
         self.assertEqual(
-            self.comp.pending_length_updates.get(self.long_idx), self.budget
+            self.comp.pending_length_updates[self.long_idx][0], self.budget
         )
         self.assertNotIn(self.short_idx, self.comp.pending_length_updates)
         self.assertEqual(len(self.comp._armed), 0)
@@ -655,7 +659,7 @@ class TestMultiRequestAndFailure(unittest.TestCase):
         self.assertEqual(len(alloc.freed), 3)  # one free per request
         self.assertEqual(len(comp._pending_commits), 0)  # queue drained
         for idx, (req, base) in reqs.items():
-            self.assertEqual(comp.pending_length_updates[idx], self.budget)
+            self.assertEqual(comp.pending_length_updates[idx][0], self.budget)
             self.assertEqual(req.kv_committed_len, self.budget)
             # freed = the physical tail [budget, seq_len) of THIS request
             self.assertEqual(
@@ -983,6 +987,174 @@ class TestTensorParallelScore(unittest.TestCase):
         for _ in range(3):
             comp._check_kept_consistent_across_tp(torch.tensor([1, 3, 4, 5]))
         self.assertEqual(g.n_all_reduce, fired)
+
+
+class TestPendingUpdateLifecycle(unittest.TestCase):
+    """Issue 1 regressions: no pending physical-length update may survive a
+    finish/retract and be applied to the next request that reuses the slot."""
+
+    def _build(self):
+        device = torch.device("cpu")
+        r2t = MockReqToTokenPool(8, 64, device)
+        kv = MockKVPool(2, 128, 2, 4, device, torch.float32)
+        comp = RKVCompressor(
+            config=RKVConfig(budget=4, window_size=2, buffer_size=4),
+            req_to_token_pool=r2t,
+            token_to_kv_pool=kv,
+            kv_allocator=MockAllocator(),
+            start_layer=0,
+            end_layer=2,
+            device=device,
+            q_head_num=2,
+            head_dim=4,
+            q_dtype=torch.float32,
+        )
+        return comp, r2t
+
+    def _compact(self, comp, r2t, idx):
+        """Register a request at ``idx``, prepare + commit one compaction (which
+        publishes a pending length update), and return the request."""
+        req = _MockReq(origin_len=20, output_len=100, req_pool_idx=idx)
+        comp.on_request_begin(req)
+        r2t.req_to_token[idx, :6] = torch.arange(10, 16, dtype=torch.int32)
+        comp._pending_commits.append(
+            comp._prepare_compaction(comp.states[idx], 6, torch.tensor([0, 2, 4, 5]))
+        )
+        comp.commit_compactions()
+        return req
+
+    def test_pending_update_carries_owner_identity(self):
+        comp, r2t = self._build()
+        req = self._compact(comp, r2t, 1)
+        new_len, owner = comp.pending_length_updates[1]
+        self.assertEqual(new_len, 4)
+        self.assertIs(owner, req)  # identity attached for scheduler validation
+
+    def test_finish_clears_pending_update(self):
+        comp, r2t = self._build()
+        req = self._compact(comp, r2t, 1)
+        self.assertIn(1, comp.pending_length_updates)  # commit published it
+        comp.on_request_end(req)  # compact + finish on the same step
+        self.assertNotIn(1, comp.pending_length_updates)  # finish cleared it
+        self.assertNotIn(1, comp.states)
+
+    def test_retract_clears_pending_update(self):
+        comp, r2t = self._build()
+        req = self._compact(comp, r2t, 1)
+        self.assertIn(1, comp.pending_length_updates)
+        comp.on_request_retract(req)
+        self.assertNotIn(1, comp.pending_length_updates)
+        self.assertNotIn(1, comp.states)
+
+    def test_slot_reuse_after_finish_leaves_no_stale_update(self):
+        # A compacts at idx 1 and finishes as the last request; the running
+        # batch goes empty so the scheduler never drained the update. B then
+        # reuses idx 1. The drain must not carry A's stale budget onto B.
+        comp, r2t = self._build()
+        req_a = self._compact(comp, r2t, 1)
+        comp.on_request_end(req_a)
+        req_b = _MockReq(origin_len=7, output_len=0, req_pool_idx=1)
+        comp.on_request_begin(req_b)  # B reuses slot 1
+        self.assertEqual(comp.take_pending_length_updates(), {})
+
+    def test_stale_update_owner_mismatches_reused_request(self):
+        # If a clear were ever missed, the update's owner is still request A, not
+        # the request B that reuses the slot -- so the scheduler identity guard
+        # (owner is req) skips it. Pin that the owner is NOT the reused request.
+        comp, r2t = self._build()
+        req_a = self._compact(comp, r2t, 1)
+        _, owner = comp.pending_length_updates[1]
+        req_b = _MockReq(origin_len=7, output_len=0, req_pool_idx=1)
+        comp.on_request_begin(req_b)
+        self.assertIs(owner, req_a)
+        self.assertIsNot(owner, req_b)
+
+
+class TestRuntimeSupportGate(unittest.TestCase):
+    """Issue 2: the late (post-resolution) gate hard-fails any runtime the R-KV
+    observation/compaction hooks are not wired for."""
+
+    def _reason(self, **over):
+        kw = dict(
+            mode="decode",
+            prefill_backend="flashinfer",
+            decode_backend="flashinfer",
+            use_mla=False,
+            is_hybrid_swa=False,
+            spec_enabled=False,
+            page_size=1,
+        )
+        kw.update(over)
+        return rkv_runtime_support_error(**kw)
+
+    def test_flashinfer_mha_supported(self):
+        self.assertIsNone(self._reason())
+        self.assertIsNone(self._reason(mode="prefill", page_size=None))
+
+    def test_non_flashinfer_backend_rejected(self):
+        self.assertIsNotNone(self._reason(decode_backend="fa3"))
+        self.assertIsNotNone(self._reason(prefill_backend="triton"))
+        self.assertIsNotNone(self._reason(decode_backend=None))
+
+    def test_mla_rejected(self):
+        self.assertIsNotNone(self._reason(use_mla=True))
+
+    def test_hybrid_swa_rejected(self):
+        self.assertIsNotNone(self._reason(is_hybrid_swa=True))
+
+    def test_speculative_rejected(self):
+        self.assertIsNotNone(self._reason(spec_enabled=True))
+
+    def test_page_size_gt_one_rejected(self):
+        self.assertIsNotNone(self._reason(page_size=16))
+        self.assertIsNone(self._reason(page_size=1))
+        self.assertIsNone(self._reason(page_size=None))
+
+
+class TestServingConfigValidation(unittest.TestCase):
+    """Issue 3: config-level guards + serving restricted to the bounded path."""
+
+    def _serve(self, **cfg):
+        return RKVCompressor(
+            config=RKVConfig(**cfg),
+            req_to_token_pool=MockReqToTokenPool(4, 128, torch.device("cpu")),
+            token_to_kv_pool=MockKVPool(
+                2, 128, 2, 4, torch.device("cpu"), torch.float32
+            ),
+            kv_allocator=MockAllocator(),
+            start_layer=0,
+            end_layer=2,
+            device=torch.device("cpu"),
+            q_head_num=2,
+            head_dim=4,
+            q_dtype=torch.float32,
+        )
+
+    def test_even_kernel_size_rejected(self):
+        with self.assertRaises(ValueError):
+            RKVConfig(budget=64, window_size=8, kernel_size=8)
+
+    def test_nonpositive_window_rejected(self):
+        with self.assertRaises(ValueError):
+            RKVConfig(budget=64, window_size=0)
+
+    def test_unknown_retain_direction_rejected(self):
+        with self.assertRaises(ValueError):
+            RKVConfig(budget=64, window_size=8, retain_direction="middle")
+
+    def test_odd_kernel_and_known_retain_accepted(self):
+        RKVConfig(budget=64, window_size=8, kernel_size=7, retain_direction="first")
+
+    def test_serving_rejects_non_last_retain(self):
+        # The algorithm accepts other directions offline, but the SERVED
+        # compressor is restricted to the memory-bounded retain_direction="last"
+        # path (others build an unbounded kv_heads x n x n matrix).
+        with self.assertRaises(ValueError):
+            self._serve(budget=64, window_size=8, retain_direction="first")
+
+    def test_serving_accepts_last_retain(self):
+        comp = self._serve(budget=64, window_size=8, retain_direction="last")
+        self.assertEqual(comp.config.retain_direction, "last")
 
 
 if __name__ == "__main__":
