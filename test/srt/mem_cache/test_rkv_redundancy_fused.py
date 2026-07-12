@@ -148,6 +148,46 @@ class TestFusedRedundancyRetain(unittest.TestCase):
         got = self.fused(key, threshold=0.99)
         self.assertTrue(torch.allclose(ref, got, atol=5e-4, rtol=1e-3))
 
+    def test_run_to_run_determinism(self):
+        # The retain kernel uses tl.atomic_add, whose FP accumulation order can
+        # vary between launches. Measured (2026-07-11, H100): the resulting score
+        # jitter is negligible — 0.0 for bf16/fp16 (rounded away) and ~1e-10 for
+        # fp32 — and it NEVER flips the top-k kept set, which is the only thing
+        # that could change the model output. This pins both: a regression that
+        # introduced meaningful jitter or an unstable kept set would fail.
+        window, budget = 32, 256
+        for dtype, score_atol in (
+            (torch.bfloat16, 1e-6),
+            (torch.float16, 1e-6),
+            (torch.float32, 1e-6),
+        ):
+            torch.manual_seed(123)
+            key = torch.randn(1, 8, 1024, 128, device="cuda", dtype=dtype)
+            ref = self.fused(key, threshold=0.5).float()
+            ref_kept = (
+                ref[:, :, :-window]
+                .topk(budget - window, dim=-1)
+                .indices.sort(-1)
+                .values
+            )
+            for _ in range(25):
+                got = self.fused(key, threshold=0.5).float()
+                self.assertLessEqual(
+                    (got - ref).abs().max().item(),
+                    score_atol,
+                    f"fused kernel jitter exceeds {score_atol} ({dtype})",
+                )
+                kept = (
+                    got[:, :, :-window]
+                    .topk(budget - window, dim=-1)
+                    .indices.sort(-1)
+                    .values
+                )
+                self.assertTrue(
+                    torch.equal(kept, ref_kept),
+                    f"fused kernel kept-set is nondeterministic ({dtype})",
+                )
+
 
 @unittest.skipUnless(
     _HAS_CUDA and _HAS_TRITON, "fused redundancy kernel needs CUDA + Triton"

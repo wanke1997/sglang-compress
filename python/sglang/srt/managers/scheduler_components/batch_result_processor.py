@@ -684,6 +684,20 @@ class SchedulerBatchResultProcessor:
                 value=can_run_cuda_graph
             )
 
+        # R-KV two-phase compaction COMMIT: the decode forward relocated the
+        # surviving K/V (prepare phase) and queued commit records; now that the
+        # forward has completed (a stream-synced point) apply them — free the
+        # evicted tail slots and finalize per-request length bookkeeping — BEFORE
+        # the per-request release loop below, so a request that compacted and
+        # finished in the same step frees its tail here and only its (shrunk)
+        # head in release_kv_cache (no double-free). Keeping the allocator free
+        # off the forward stream is what the two-phase split buys.
+        _rkv = getattr(
+            getattr(self.model_worker, "model_runner", None), "rkv_compressor", None
+        )
+        if _rkv is not None:
+            _rkv.commit_compactions()
+
         self.token_to_kv_pool_allocator.free_group_begin()
 
         for i, req in enumerate(batch.reqs):

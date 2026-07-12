@@ -38,8 +38,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.rkv.algo import R1KV
@@ -52,6 +53,33 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids heavy imports
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
+
+# Cap on the batched-scoring transient (cosine matrix + mask + indices) per
+# compaction. Because compactions run sequentially (one armed request at a time
+# in ``maybe_compact``), this is also the per-step compaction-workspace peak the
+# KV-pool sizing reserves so a compaction never OOMs on transient tensors even
+# when the pool is full (ModelRunner._reserve_rkv_decode_aux_bytes).
+RKV_SCORE_CHUNK_BYTES: int = 512 << 20
+
+
+class _CompactionCommit(msgspec.Struct):
+    """One prepared compaction awaiting the scheduler-synced commit.
+
+    Emitted by the forward-side *prepare* phase (``_prepare_compaction``), after
+    the surviving K/V has already been relocated to the front ``budget`` slots.
+    The scheduler drains these after the forward (``commit_compactions``) to free
+    the tail slots and finalize the request bookkeeping, so the allocator is
+    mutated only at a point where the forward stream is synced — not from inside
+    the forward. ``freed_slots`` is a device tensor and ``req`` a duck-typed
+    ``Req``; this struct is an in-process container only (never serialized).
+    """
+
+    req_pool_idx: int
+    budget: int
+    seq_len: int
+    freed_slots: Any
+    req: Any
 
 
 @dataclass
@@ -82,14 +110,20 @@ class RKVConfig:
     def __post_init__(self) -> None:
         if self.min_seq_len is None:
             self.min_seq_len = self.budget
-        assert self.budget > self.window_size, "budget must exceed window_size"
-        assert self.buffer_size >= self.window_size, (
-            "buffer_size must be >= window_size, otherwise the first compaction "
-            "scores against zero-initialized queries in the observation window"
-        )
-        assert (
-            self.min_seq_len >= self.budget
-        ), "min_seq_len must be >= budget (select_indices keeps budget tokens)"
+        # Config validation raises (not assert, which -O strips) so an invalid
+        # --rkv-config can never silently start a corrupting server.
+        if self.budget <= self.window_size:
+            raise ValueError("R-KV budget must exceed window_size")
+        if self.buffer_size < self.window_size:
+            raise ValueError(
+                "R-KV buffer_size must be >= window_size, otherwise the first "
+                "compaction scores against zero-initialized observation queries"
+            )
+        if self.min_seq_len < self.budget:
+            raise ValueError(
+                "R-KV min_seq_len must be >= budget (select_indices keeps budget "
+                "tokens)"
+            )
 
 
 class RKVRequestState:
@@ -149,6 +183,7 @@ class RKVCompressor:
         q_head_num: int,
         head_dim: int,
         q_dtype: torch.dtype,
+        fused_validation: str = "first-request",
     ) -> None:
         self.config = config
         self.req_to_token_pool = req_to_token_pool
@@ -166,12 +201,29 @@ class RKVCompressor:
             mix_lambda=config.mix_lambda,
             retain_ratio=config.retain_ratio,
             retain_direction=config.retain_direction,
+            fused_validation=fused_validation,
+        )
+        # Startup fused-kernel validation (no-op unless fused_validation ==
+        # "startup"): warm the fused-vs-reference gate now, using the real KV
+        # head count / dtype, so the first real compaction pays no gate cost.
+        k0 = self.token_to_kv_pool.get_key_buffer(self.start_layer)
+        self.algo.warmup_fused_kernel(
+            kv_heads=k0.shape[1],
+            head_dim=head_dim,
+            device=device,
+            dtype=k0.dtype,
+            seq_len=config.budget,
         )
 
         # Active per-request state, keyed by req_pool_idx.
         self.states: Dict[int, RKVRequestState] = {}
         # req_pool_idx values that armed a compaction this forward pass.
         self._armed: set[int] = set()
+        # Two-phase compaction: the forward-side prepare phase relocates K/V and
+        # appends a commit record here; the scheduler drains it after the forward
+        # (``commit_compactions``) to free slots + finalize bookkeeping, keeping
+        # allocator mutation out of the forward stream.
+        self._pending_commits: List[_CompactionCommit] = []
         # req_pool_idx -> new physical KV length after the latest compaction.
         # The scheduler drains this (``take_pending_length_updates``) to update
         # the batch-level seq_lens tensors, which it owns.
@@ -181,8 +233,10 @@ class RKVCompressor:
         # = they differed on the first compaction (per-layer fallback forever).
         self._batched_ok: Optional[bool] = None
         # Cap the batched-scoring transient (cosine matrix + mask + indices) so
-        # peak memory stays bounded when budget (=> seq_len) is large.
-        self._score_chunk_bytes: int = 512 << 20
+        # peak memory stays bounded when budget (=> seq_len) is large. This is
+        # also the per-request compaction-workspace bound the KV-pool sizing
+        # reserves (ModelRunner._reserve_rkv_decode_aux_bytes).
+        self._score_chunk_bytes: int = RKV_SCORE_CHUNK_BYTES
 
         # --- (1c) in-graph decode query collection ---
         # Rolling per-layer observation-window buffer, keyed by req_pool_idx (so
@@ -191,6 +245,15 @@ class RKVCompressor:
         # op as set_kv_buffer writing token_to_kv_pool at out_cache_loc -- so the
         # observation-window steps no longer need to run eager. Circular over
         # window_size; the write slot is a global (batch-synchronous) counter.
+        #
+        # Row count == req_to_token rows == max_running_requests + 1, so there is
+        # exactly one row per possible concurrent request (no oversized pool: the
+        # decode concurrency ceiling IS the row count). Row 0 is the reserved
+        # ReqToTokenPool padding slot (never assigned to a real request), which is
+        # what makes the unconditional in-graph scatter safe under CUDA-graph
+        # padding -- see collect_decode_query. This buffer is reserved in the KV
+        # pool sizing (ModelRunner._reserve_rkv_decode_aux_bytes) so it cannot OOM
+        # at startup.
         max_reqs = req_to_token_pool.req_to_token.shape[0]
         window = config.window_size
         self.rolling_q = torch.zeros(
@@ -203,11 +266,21 @@ class RKVCompressor:
             self.num_layers, window * max_reqs, q_head_num, head_dim
         )
         self._rolling_max_reqs = max_reqs
-        # This step's circular write slot = global_step % window_size. A fixed-
-        # address GPU scalar; begin_decode_step refreshes it every step (incl.
-        # graph-replay steps), so the captured scatter writes the right slot.
-        self.window_slot = torch.zeros((), device=device, dtype=torch.long)
-        self._global_step = 0
+        # Per-request decode-step counter, keyed by req_pool_idx (a fixed-address
+        # GPU tensor). This step's circular write slot for request ``r`` is
+        # ``step_count_of_req[r] % window_size``. begin_decode_step advances it
+        # for every request in the batch each decode step (incl. graph-replay
+        # steps), and collect_decode_query reads it in-graph. Per-request (not a
+        # single global cursor) so the observation window stays correct even if a
+        # request skips decode steps (future preemption/pipeline/overlap): each
+        # request's slots only advance on the steps it actually participates in.
+        # Padding safety does NOT depend on row 0's counter value: row 0 is the
+        # reserved ReqToTokenPool padding slot (never a real request), so any
+        # padding-row write lands on rolling_q row 0 harmlessly regardless of the
+        # counter — the same reason the in-graph scatter is safe under padding.
+        self.step_count_of_req = torch.zeros(
+            (max_reqs,), device=device, dtype=torch.long
+        )
 
     # ------------------------------------------------------------------
     # Request lifecycle
@@ -220,6 +293,9 @@ class RKVCompressor:
         state.next_position = len(req.origin_input_ids)
         state.req = req
         self.states[req.req_pool_idx] = state
+        # Reset this slot's step counter so a reused req_pool_idx starts a fresh
+        # observation window (does not inherit the previous request's cursor).
+        self.step_count_of_req[req.req_pool_idx] = 0
 
     def on_request_end(self, req: Req) -> None:
         """Drop a request's R-KV state when it finishes or aborts."""
@@ -289,12 +365,28 @@ class RKVCompressor:
         ``collect_decode_query``, so the window steps no longer force eager --
         they replay the captured decode graph like any other step.
         """
-        # Advance the global circular write slot EVERY decode step (even with no
-        # managed requests) and refresh the fixed-address GPU scalar the captured
-        # rolling_q scatter reads. begin_decode_step runs BEFORE the graph/eager
-        # decision, so this refresh reaches graph-replay steps.
-        self._global_step += 1
-        self.window_slot.fill_(self._global_step % self.config.window_size)
+        # Advance the per-request circular write cursor EVERY decode step (even
+        # with no managed requests). Vectorized over the whole batch on the GPU
+        # tensor the captured rolling_q scatter reads; begin_decode_step runs
+        # BEFORE the graph/eager decision, so this advance reaches graph-replay
+        # steps. Per-request (not one global cursor) so each request's window
+        # only advances on the steps it actually participates in — correct even
+        # if a request skips decode steps (future preemption/pipeline/overlap).
+        # Reused req_pool_idx slots are additionally protected by
+        # buffer_size >= window_size (asserted in RKVConfig), which forces
+        # >= window_size fresh writes before the first compaction, and by the
+        # on_request_begin counter reset.
+        #
+        # CUDA-graph ordering: this eager ``+= 1`` is issued on the current
+        # stream, and the captured decode graph is replayed with a plain
+        # ``cuda_graph.replay()`` on that same current stream (see the
+        # full/tc-piecewise graph backends — no stream switch; overlap and
+        # PDMux, which could introduce a second stream, are rejected for R-KV).
+        # Same-stream ops execute in issue order, so the counter update
+        # happens-before the graph read of ``step_count_of_req`` — the identical
+        # guarantee ``set_kv_buffer`` (out_cache_loc written eagerly, read
+        # in-graph) already relies on.
+        self.step_count_of_req[forward_batch.req_pool_indices] += 1
 
         if not self.states:
             return False
@@ -334,18 +426,29 @@ class RKVCompressor:
         """In-graph rolling collection of this layer's decode query.
 
         Writes ``q`` ``(bs, q_head_num, head_dim)`` into the fixed ``rolling_q``
-        buffer at the current global ``window_slot``, indexed by req_pool_idx.
+        buffer at each request's current circular write slot
+        (``step_count_of_req[r] % window_size``), indexed by req_pool_idx.
         Pure-tensor scatter (no host sync / Python loop), so it is captured in
         the decode CUDA graph and runs on graph-replay steps too -- the same
         class of op as ``set_kv_buffer`` scattering into ``token_to_kv_pool`` at
         ``out_cache_loc``. This is what lets observation-window steps stop
         running eager (P3). Unconditional so CUDA-graph capture includes it.
+
+        CUDA-graph padding safety: a padded replay batch fills the tail
+        ``req_pool_indices`` with 0 (PaddingPolicy.ZERO), so padding rows scatter
+        their (discarded) query into ``rolling_q`` row 0 -- the reserved
+        ReqToTokenPool padding slot, never a real request -- exactly as those
+        rows write ``token_to_kv_pool`` at ``out_cache_loc`` 0. No real request's
+        observation window is corrupted.
         """
         layer_idx = layer.layer_id - self.start_layer
-        # Flattened index into (window * max_reqs): slot-major, req-minor.
-        index = (
-            self.window_slot * self._rolling_max_reqs + forward_batch.req_pool_indices
-        )
+        # This step's circular write slot per request = step_count % window.
+        # Read in-graph from the fixed-address per-request counter tensor that
+        # begin_decode_step advanced this step. Flattened index into
+        # (window * max_reqs): slot-major, req-minor.
+        req_indices = forward_batch.req_pool_indices
+        cur = self.step_count_of_req[req_indices] % self.config.window_size
+        index = cur * self._rolling_max_reqs + req_indices
         self._rolling_q_flat[layer_idx].index_copy_(0, index, q)
 
     def _read_window_rolling(self, req_pool_idx: int) -> torch.Tensor:
@@ -356,7 +459,8 @@ class RKVCompressor:
         """
         w = self.rolling_q[:, :, req_pool_idx]  # (num_layers, window, q_heads, hd)
         window = self.config.window_size
-        cur = self._global_step % window  # newest write slot
+        # This request's own newest write slot (per-request cursor).
+        cur = int(self.step_count_of_req[req_pool_idx].item()) % window
         return torch.roll(w, shifts=-(cur + 1), dims=1)
 
     def _layer_score(
@@ -375,9 +479,10 @@ class RKVCompressor:
         # (num_slots, kv_heads, head_dim); gather this request's slots.
         keys = k_buffer[slots].unsqueeze(0).transpose(1, 2).contiguous()
 
-        # queries: (1, q_heads, window_size, head_dim). window_q is filled in
-        # temporal order (slot 0 oldest .. window_size-1 newest) over the eager
-        # window steps that begin_decode_step forced before this compaction.
+        # queries: (1, q_heads, window_size, head_dim). window_q holds the last
+        # window_size decode queries in temporal order (slot 0 oldest ..
+        # window_size-1 newest), read from the in-graph rolling collection
+        # (_read_window_rolling) at compaction time.
         window_q = state.window_q[layer_idx]  # (window, q_heads, head_dim)
         queries = window_q.unsqueeze(0).transpose(1, 2).contiguous()
 
@@ -447,27 +552,57 @@ class RKVCompressor:
         return acc
 
     # ------------------------------------------------------------------
-    # Compaction (called once after the full forward pass)
+    # Compaction (prepare in the forward, commit at a scheduler-synced point)
     # ------------------------------------------------------------------
     def maybe_compact(self, forward_batch: ForwardBatch) -> None:
-        """Run physical compaction for any request armed this forward pass.
+        """Prepare physical compaction for any request armed this forward pass.
 
-        Scoring is batched across all layers here (see ``_batched_scores``). On
-        the first compaction an A/B gate compares the batched kept-set against
-        the per-layer reference; if they differ it falls back to the per-layer
-        path permanently (protecting accuracy).
+        This is the **prepare** phase, run at the end of the decode forward: it
+        scores each armed request and relocates its surviving K/V to the front
+        ``budget`` slots (forward-stream compute), then appends a commit record
+        to ``_pending_commits``. The allocator free + request bookkeeping is
+        deferred to ``commit_compactions`` (called by the scheduler after the
+        forward), so allocator state is never mutated from inside the forward
+        stream. Scoring is batched across all layers (see ``_batched_scores``);
+        the first compaction runs an A/B gate against the per-layer reference.
+
+        Fail-stop contract: the relocation is in-place, so a request that raises
+        mid-relocation (OOM, a validation guard, a CUDA fault) is left partially
+        moved. Any exception raised here is therefore UNRECOVERABLE — the caller
+        (ModelRunner forward) must let it propagate and terminate the worker; it
+        must NOT be caught-and-continued, or the partially-relocated request
+        would serve corrupt KV. ``_armed`` is cleared up front (below) only so a
+        *restarted* accumulator does not inherit stale arming, not to imply the
+        current worker can recover.
         """
         if not self._armed:
             return
 
+        # Clear the armed set up front so a mid-loop exception (Triton failure,
+        # OOM, a validation guard) cannot carry stale armed requests forward.
+        # This is fail-stop hygiene, not recovery (see the contract above).
+        armed = self._armed
+        self._armed = set()
+
         seq_len_by_req = self._seq_len_by_req(forward_batch)
-        for req_pool_idx in list(self._armed):
+        for req_pool_idx in list(armed):
+            # An armed request was armed from THIS forward's req_pool_indices in
+            # begin_decode_step, and no lifecycle hook runs between arming and
+            # here (same forward). So a missing state or seq_len is a genuine
+            # lifecycle desync, not an expected skip — fail fast rather than
+            # silently drop the compaction and let the request's KV grow.
             state = self.states.get(req_pool_idx)
             if state is None:
-                continue
+                raise RuntimeError(
+                    f"Armed R-KV request {req_pool_idx} has no compressor state "
+                    "(lifecycle desync between arming and compaction)"
+                )
             seq_len = seq_len_by_req.get(req_pool_idx)
             if seq_len is None:
-                continue
+                raise RuntimeError(
+                    f"Armed R-KV request {req_pool_idx} is missing from the "
+                    "ForwardBatch it was armed from"
+                )
 
             # P2: the observation-window queries now come from the in-graph
             # rolling collection (un-rotated to temporal order), not the eager
@@ -502,9 +637,25 @@ class RKVCompressor:
                 )
                 kept = self._assemble_kept(score, seq_len)
 
-            self._compact_request(state, seq_len, kept)
+            self._pending_commits.append(self._prepare_compaction(state, seq_len, kept))
 
-        self._armed.clear()
+    def commit_compactions(self) -> None:
+        """Commit phase: apply every prepared compaction.
+
+        The scheduler calls this after the decode forward has completed (a
+        stream-synced point), *before* it releases any finished request's KV, so
+        the tail free + ``req_to_token`` clear land before ``release_kv_cache``
+        (no double-free) and the allocator is mutated with the forward stream
+        idle. No-op when nothing was prepared.
+        """
+        if not self._pending_commits:
+            return
+        # Drain up front so a mid-loop failure cannot re-commit an already-freed
+        # plan on a later call.
+        plans = self._pending_commits
+        self._pending_commits = []
+        for plan in plans:
+            self._commit_compaction(plan)
 
     def _assemble_kept(self, score_accum: torch.Tensor, seq_len: int) -> torch.Tensor:
         """Global kept-token indices: top past tokens + trailing window.
@@ -522,25 +673,62 @@ class RKVCompressor:
         kept = torch.cat([past_idx, window_idx])
         return torch.sort(kept).values
 
-    def _compact_request(
+    def _prepare_compaction(
         self, state: RKVRequestState, seq_len: int, kept_local: torch.Tensor
-    ) -> None:
-        """Physically compact one request's KV cache (page_size == 1).
-
-        Relocates surviving slots' K/V to the front ``budget`` slots for every
-        layer, frees the freed tail slots, rewrites ``req_to_token``, and clears
-        the tail. Kept indices must be ascending.
+    ) -> _CompactionCommit:
+        """Prepare phase (runs in the forward): relocate one request's surviving
+        K/V to the front ``budget`` slots for every layer (page_size == 1) and
+        return a commit record. Does NOT free slots, clear ``req_to_token``, or
+        touch request lengths — those are the scheduler-synced commit phase
+        (``_commit_compaction``), so the allocator is mutated only with the
+        forward stream idle. Kept indices must be ascending.
         """
         idx = state.req_pool_idx
         budget = self.config.budget
         r2t = self.req_to_token_pool.req_to_token
 
         slots = r2t[idx, :seq_len].long().clone()  # physical slots, temporal order
+
+        # Validate the kept set and the physical slot table BEFORE mutating any
+        # buffer, so a bad score/select or a corrupt req_to_token can never write
+        # KV out of bounds, relocate from a duplicate slot, or double-free (every
+        # check is on indices only — no KV writes have happened yet). These are
+        # production safety barriers, so they RAISE rather than ``assert`` (which
+        # ``python -O`` strips). Cheap: O(seq_len), once per compaction.
+        if kept_local.numel() != budget:
+            raise RuntimeError(
+                f"R-KV kept set has {kept_local.numel()} entries, expected "
+                f"budget {budget}"
+            )
+        if kept_local.numel() > 0:
+            kept_min = int(kept_local.min())
+            kept_max = int(kept_local.max())
+            if kept_min < 0 or kept_max >= seq_len:
+                raise RuntimeError(
+                    f"R-KV kept indices out of range [0, {seq_len}): "
+                    f"[{kept_min}, {kept_max}]"
+                )
+        if not bool(torch.all(kept_local[1:] > kept_local[:-1])):
+            raise RuntimeError(
+                "R-KV kept indices must be strictly ascending (unique, sorted)"
+            )
+        # The WHOLE physical slot table for this request must be a 1-to-1 map,
+        # not just the survivors: a duplicate anywhere in slots[:seq_len] could
+        # put the same slot in both the freed tail and the kept head, so commit
+        # would free a slot req_to_token still references (use-after-free).
+        # Checking the full table subsumes the survivors-unique check.
+        if slots.unique().numel() != slots.numel():
+            raise RuntimeError(
+                "R-KV req_to_token contains duplicate physical KV slots "
+                "(allocator corruption); refusing to compact"
+            )
+
         src = slots[kept_local]  # surviving physical slots (budget,)
         dst = slots[:budget]  # target front slots (budget,)
 
         # Relocate K/V for every layer. Clone before write so overlapping
-        # src/dst ranges don't corrupt each other.
+        # src/dst ranges don't corrupt each other. This is forward-stream compute
+        # on the KV buffers; it does NOT touch the allocator.
         for layer_id in range(self.start_layer, self.end_layer):
             k_buffer = self.token_to_kv_pool.get_key_buffer(layer_id)
             v_buffer = self.token_to_kv_pool.get_value_buffer(layer_id)
@@ -549,16 +737,55 @@ class RKVCompressor:
             k_buffer[dst] = k_keep
             v_buffer[dst] = v_keep
 
-        # Free the tail slots (page_size == 1 => per-slot free).
-        freed = slots[budget:seq_len]
-        if freed.numel() > 0:
-            self.kv_allocator.free(freed.to(r2t.dtype))
-
-        # req_to_token[:budget] already equals ``dst`` (same physical slots),
-        # now holding the relocated kept KV in temporal order. Clear the tail.
-        r2t[idx, budget:seq_len] = 0
-
+        # Reset the trigger counter now (compressor-local state, not allocator).
         state.steps_since_compact = 0
+
+        # The tail slots [budget, seq_len) are the survivors' old homes plus the
+        # evicted tokens; they are freed in the commit phase. ``slots`` is a
+        # clone, so this stays valid after req_to_token is cleared at commit.
+        freed = slots[budget:seq_len].to(r2t.dtype)
+        return _CompactionCommit(
+            req_pool_idx=idx,
+            budget=budget,
+            seq_len=seq_len,
+            freed_slots=freed,
+            req=state.req,
+        )
+
+    def _commit_compaction(self, plan: _CompactionCommit) -> None:
+        """Commit phase (scheduler-synced): free the tail slots, clear the
+        ``req_to_token`` tail, and shrink the request's physical length.
+
+        Runs after the forward at a stream-synced scheduler point, so the
+        allocator free never races the forward. ``req_to_token[:budget]`` already
+        holds the relocated kept KV (written in the prepare phase); here we only
+        release the tail the survivors vacated.
+        """
+        idx = plan.req_pool_idx
+        budget = plan.budget
+        seq_len = plan.seq_len
+        r2t = self.req_to_token_pool.req_to_token
+
+        # Stale-plan guard: if the request slot was released or reused between
+        # prepare (forward) and this commit, the tracked identity no longer
+        # matches the plan. The prepare phase already relocated this request's
+        # K/V, so a mismatch is an unrecoverable invariant break (the scheduler
+        # order guarantees commit runs before any release), NOT something to skip
+        # — fail the worker rather than free/rewrite the wrong request's slots.
+        state = self.states.get(idx)
+        if state is None or state.req is not plan.req:
+            raise RuntimeError(
+                f"Stale R-KV compaction plan for req_pool_idx={idx}: request "
+                "slot was released or reused between prepare and commit"
+            )
+
+        # Free the tail slots (page_size == 1 => per-slot free).
+        if plan.freed_slots.numel() > 0:
+            self.kv_allocator.free(plan.freed_slots)
+
+        # req_to_token[:budget] already equals the relocated kept KV in temporal
+        # order. Clear the tail.
+        r2t[idx, budget:seq_len] = 0
 
         # Physical-length bookkeeping. The scheduler normally treats seq_lens as
         # BOTH the physical KV length AND the rotary position source; R-KV breaks
@@ -566,13 +793,13 @@ class RKVCompressor:
         # owning request here (same process, shared pools), and expose the new
         # length via ``pending_length_updates`` so the scheduler can update its
         # batch-level seq_lens / seq_lens_cpu tensors. Rotary positions stay
-        # *logical* and are supplied separately via ``logical_position`` (see the
-        # wiring notes at the bottom of the file). ``next_position`` is
-        # intentionally NOT rewound: future tokens keep their absolute positions
-        # so their rotary stays consistent with the retained keys.
-        if state.req is not None:
-            state.req.kv_committed_len = budget
-            state.req.kv_allocated_len = budget
+        # *logical* and are supplied separately via ``logical_position``.
+        # ``next_position`` is intentionally NOT rewound: future tokens keep
+        # their absolute positions so their rotary stays consistent with the
+        # retained keys.
+        if plan.req is not None:
+            plan.req.kv_committed_len = budget
+            plan.req.kv_allocated_len = budget
         self.pending_length_updates[idx] = budget
 
         logger.info(
@@ -580,7 +807,7 @@ class RKVCompressor:
             idx,
             seq_len,
             budget,
-            freed.numel(),
+            plan.freed_slots.numel(),
         )
 
     # ------------------------------------------------------------------
@@ -635,16 +862,27 @@ class RKVCompressor:
         """
         if forward_batch.positions is None:
             return
-        req_indices = forward_batch.req_pool_indices
-        for i in range(req_indices.shape[0]):
-            st = self.states.get(int(req_indices[i].item()))
+        # One GPU->CPU sync for the whole batch (tolist) instead of a .item()
+        # per request each decode step; collect the logical overrides and apply
+        # them in a single batched scatter rather than an element write per req.
+        req_indices = forward_batch.req_pool_indices.tolist()
+        rows: List[int] = []
+        values: List[int] = []
+        for i, req_pool_idx in enumerate(req_indices):
+            st = self.states.get(int(req_pool_idx))
             if st is not None and st.req is not None:
                 # logical_position() counts all tokens seen so far INCLUDING the
                 # token being decoded this step (it was appended to output_ids
                 # when it was sampled), so the current token's 0-based rotary
                 # position is that count minus one — for an un-compacted request
                 # this equals the baseline clamp_position(seq_lens) = seq_lens-1.
-                forward_batch.positions[i] = self.logical_position(st.req) - 1
+                rows.append(i)
+                values.append(self.logical_position(st.req) - 1)
+        if rows:
+            positions = forward_batch.positions
+            idx = torch.tensor(rows, device=positions.device, dtype=torch.long)
+            val = torch.tensor(values, device=positions.device, dtype=positions.dtype)
+            positions[idx] = val
 
 
 # ---------------------------------------------------------------------------
@@ -655,9 +893,13 @@ class RKVCompressor:
 #   1. FlashInferAttnBackend.forward_decode: after set_kv_buffer, call
 #      compressor.collect_decode_query(q, layer, forward_batch) (in-graph).
 #   2. model_runner (or the backend's end-of-forward hook): after the full
-#      decode forward pass, call compressor.maybe_compact(forward_batch), then
-#      have the scheduler apply take_pending_length_updates() to batch.seq_lens
-#      / seq_lens_cpu (kv_committed_len / kv_allocated_len are already updated).
+#      decode forward pass, call compressor.maybe_compact(forward_batch) (the
+#      PREPARE phase — relocates surviving K/V, queues commit records). The
+#      scheduler then, after the forward has completed, calls
+#      compressor.commit_compactions() (the COMMIT phase — frees the evicted
+#      tail slots off the forward stream) and applies take_pending_length_updates()
+#      to batch.seq_lens / seq_lens_cpu (kv_committed_len / kv_allocated_len are
+#      updated in the commit phase).
 #   3. scheduler / schedule_batch: call on_request_begin / on_request_end around
 #      a request's life; disable overlap scheduling for phase 1 (simpler timing).
 #   4. ForwardBatch construction (forward_batch_info): for R-KV-managed requests

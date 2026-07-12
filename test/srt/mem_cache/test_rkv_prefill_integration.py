@@ -178,9 +178,9 @@ class TestConfig(unittest.TestCase):
     def test_defaults_and_validation(self):
         cfg = RKVPrefillConfig()
         self.assertEqual(cfg.mode, "oneshot")
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             RKVPrefillConfig(mode="nope")
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             RKVPrefillConfig(budget=8, window_size=8)
 
 
