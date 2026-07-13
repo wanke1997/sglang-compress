@@ -38,7 +38,7 @@ GSM8K-style math harness, 20 items, few-shot prompt ≈700 tokens, `temperature=
 
 The server ran **227–230 physical compactions with zero crashes**, and at
 `concurrency=8` R-KV budget=512 sustained **272 tok/s** (batched decode). Full
-report: [`R-KV/benchmark/RESULTS_math7b.md`](R-KV/benchmark/RESULTS_math7b.md).
+report: [`R-KV/benchmark/RESULTS.md`](R-KV/benchmark/RESULTS.md).
 
 ## Quick start
 

@@ -16,12 +16,12 @@ server over the `/generate` HTTP API and judging with simple numeric matching.
 
 | File | Purpose |
 | --- | --- |
-| `launch_server.sh` | Start a server in `baseline` / `rkv <budget>` / `baseline-cudagraph` mode; set `DP=N` for N-way data parallelism |
+| `launch_server.sh` | Start a server in `rkv <budget>` / `fullkv` / `constrained` mode; set `DP=N` or `TP=N` |
 | `prepare_data.sh` | Pull the eval dataset (`test.jsonl`) from the `dev` branch |
 | `eval.py` | Drive the server over `/generate`, extract answers, report accuracy + throughput (use `--concurrency N` for server-side batch>1) |
-| `RESULTS.md` | Numbers we measured on Qwen2.5-0.5B-Instruct (H100) |
-| `RESULTS_math7b.md` | Numbers we measured on Qwen2.5-Math-7B-Instruct (H100), incl. the `budget`×`buffer_size` tuning sweep |
+| `RESULTS.md` | Qwen2.5-Math-7B GSM8K `budget`×`buffer_size` sweep (two Full-KV baselines) |
 | `RESULTS_dp.md` | Data-parallel (`--dp-size N`) correctness + throughput scaling (up to 8× H100) |
+| `RESULTS_tp.md` | Tensor-parallel (`--tp-size N`) scaling + cross-rank correctness |
 
 ## Prerequisites
 
@@ -116,7 +116,7 @@ compaction run eager (they collect the scoring queries); constraint:
 
 **Choosing values** (Qwen2.5-Math-7B, GSM8K, ~700-token prompt; throughput below is
 the current **batched-scoring** path — full grid + pre-optimization comparison in
-[`RESULTS_math7b.md`](./RESULTS_math7b.md)):
+[`RESULTS.md`](./RESULTS.md)):
 
 - **Throughput ← `buffer_size`** (not budget): at budget 512, `BUFFER=16` ≈ 990 tok/s
   vs `BUFFER=128` ≈ 1510 tok/s — a **1.5× gap** (was 2.5× before batched scoring, which
