@@ -40,8 +40,8 @@ This directory's docs and benchmark below focus on the **decode-time** mode; the
   roadmap in [`doc/FINDINGS_AND_ROADMAP.md`](doc/FINDINGS_AND_ROADMAP.md).
 - **Benchmark** — decode accuracy/speed suite in [`benchmark/`](benchmark/)
   ([`RESULTS.md`](benchmark/RESULTS.md),
-  [`RESULTS_math7b.md`](benchmark/RESULTS_math7b.md),
-  [`RESULTS_dp.md`](benchmark/RESULTS_dp.md)); the prefill mode is benchmarked on
+  [`RESULTS_dp.md`](benchmark/RESULTS_dp.md),
+  [`RESULTS_tp.md`](benchmark/RESULTS_tp.md)); the prefill mode is benchmarked on
   a summarisation task (see
   [`doc/FINDINGS_AND_ROADMAP.md`](doc/FINDINGS_AND_ROADMAP.md)).
 
@@ -62,7 +62,7 @@ eager/graph decode path is correct. Throughput here is a **~2.4× cost**, down f
 **+80%**, 546→987 tok/s): GSM8K has short outputs and no memory pressure, so R-KV is
 pure overhead with no memory payoff to recoup. R-KV wins on throughput only when the
 server is memory-bound with long decodes. Full sweep + before/after:
-[`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md).
+[`benchmark/RESULTS.md`](benchmark/RESULTS.md).
 
 ---
 
