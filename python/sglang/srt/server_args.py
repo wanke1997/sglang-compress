@@ -3022,8 +3022,15 @@ class ServerArgs:
                 "slots that the radix/prefix cache would still reference."
             )
         if not self.disable_overlap_schedule:
-            raise ValueError(
-                "--enable-rkv requires --disable-overlap-schedule (phase 1)."
+            # EXPERIMENT (branch experiment/overlap-decode-rkv): decode R-KV moved
+            # the compaction free() out of the forward into commit_compactions()
+            # at the scheduler-synced result-processing point, so the original
+            # free-on-forward-stream vs overlap-alloc-on-default-stream race
+            # should no longer apply. Allow overlap to STRESS-TEST that claim.
+            # NOT for production until validated at scale.
+            logger.warning(
+                "[EXPERIMENT] --enable-rkv with overlap schedule ENABLED "
+                "(overlap-safety of two-phase compaction is under test)."
             )
         if self.page_size not in (None, 1):
             raise ValueError("--enable-rkv requires --page-size 1 (per-slot free).")
