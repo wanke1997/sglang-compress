@@ -240,6 +240,14 @@ class RKVRequestState:
         # ``override_decode_positions``, not from this field).
         self.next_position = 0
 
+        # Cumulative number of tokens this request has evicted across all of its
+        # compactions. ``override_decode_positions`` adds it to the physical
+        # position (seq_lens - 1) to recover the LOGICAL rotary position. This is
+        # what keeps positions correct under overlap scheduling, where
+        # len(output_ids) lags one step (the sampled token is relayed via
+        # future_map and only appended in process_batch_result).
+        self.total_evicted = 0
+
         # Per-layer observation-window queries, shape
         # (num_layers, window_size, q_head_num, head_dim), set transiently in
         # ``maybe_compact`` from the in-graph ``rolling_q`` collection (read
@@ -803,6 +811,19 @@ class RKVCompressor:
             self._check_kept_consistent_across_tp(kept)
             self._pending_commits.append(self._prepare_compaction(state, seq_len, kept))
 
+    def has_pending_commits(self) -> bool:
+        """Whether the last forward prepared a compaction awaiting commit.
+
+        The overlap scheduler polls this after ``run_batch`` to decide whether
+        the just-launched decode batch must be de-overlapped: a batch that
+        prepared a compaction has to have its commit (tail free + req_to_token
+        rewrite + physical length shrink) applied BEFORE the next batch is built,
+        so the next batch is constructed against the compacted mapping/length —
+        exactly as in the non-overlap loop. Every non-compaction step stays fully
+        overlapped (see Scheduler.event_loop_overlap).
+        """
+        return bool(self._pending_commits)
+
     def commit_compactions(self) -> None:
         """Commit phase: apply every prepared compaction.
 
@@ -814,6 +835,21 @@ class RKVCompressor:
         """
         if not self._pending_commits:
             return
+        # Overlap-safety: the caller (process_batch_result) normally synced this
+        # batch's forward via ``copy_done.synchronize()`` before calling us, so
+        # the prepare-phase relocation and the ``freed_slots`` tensors are final.
+        # But under overlap a batch can prepare a compaction for a request that
+        # FINISHED one step earlier (a finished request is carried one extra
+        # decode step); that compaction is then drained while processing the
+        # EARLIER batch, whose ``copy_done`` does NOT cover the later forward that
+        # is still in flight. Synchronize the device so the allocator free never
+        # reads a ``freed_slots`` tensor — or frees slots — that an in-flight
+        # relocation is still writing. Only paid on compaction commits, which are
+        # de-overlapped points anyway.
+        dev = self.device
+        dev_type = dev.type if isinstance(dev, torch.device) else str(dev)
+        if dev_type.startswith("cuda"):
+            torch.cuda.synchronize(dev)
         # Drain up front so a mid-loop failure cannot re-commit an already-freed
         # plan on a later call.
         plans = self._pending_commits
@@ -952,6 +988,10 @@ class RKVCompressor:
 
         # Reset the trigger counter now (compressor-local state, not allocator).
         state.steps_since_compact = 0
+        # Accumulate the eviction count so ``override_decode_positions`` can
+        # recover the logical rotary position from the (shrunk) physical seq_lens
+        # without relying on len(output_ids) (which lags a step under overlap).
+        state.total_evicted += seq_len - budget
 
         # The tail slots [budget, seq_len) are the survivors' old homes plus the
         # evicted tokens; they are freed in the commit phase. ``slots`` is a
@@ -1071,8 +1111,22 @@ class RKVCompressor:
         ``seq_lens`` now tracks the (possibly shorter) physical KV length, so
         ``clamp_position(seq_lens)`` would rewind rotary after compaction. For
         every R-KV-managed request in the batch we overwrite its position with
-        ``logical_position(req)`` so future tokens keep absolute positions
-        consistent with the retained keys. No-op for requests we don't manage.
+        the LOGICAL absolute position of the token being decoded this step,
+        recovered as ``(seq_lens - 1) + total_evicted``: the physical position
+        plus every token this request has evicted so far. No-op for requests we
+        don't manage.
+
+        Overlap-safety: this derives the position from ``seq_lens`` (advanced at
+        ForwardBatch construction, correct under overlap) and the compressor's
+        own cumulative eviction counter — NOT from ``len(req.output_ids)``, which
+        lags one step under overlap scheduling (the sampled token is relayed via
+        ``future_map`` and only appended to ``output_ids`` later, in
+        ``process_batch_result``). Because it reads only ``seq_lens`` and
+        ``total_evicted`` (both stable across the forward), the two override
+        sites — ForwardBatch construction and ``init_forward_metadata`` — compute
+        the identical absolute value, so applying it at both is idempotent. In
+        the non-overlap case this equals the previous ``logical_position - 1``
+        (physical + total_evicted == len(origin) + len(output_ids)).
         """
         if forward_batch.positions is None:
             return
@@ -1080,18 +1134,22 @@ class RKVCompressor:
         # per request each decode step; collect the logical overrides and apply
         # them in a single batched scatter rather than an element write per req.
         req_indices = forward_batch.req_pool_indices.tolist()
+        seq_lens_src = forward_batch.seq_lens_cpu
+        if seq_lens_src is None:
+            seq_lens_src = forward_batch.seq_lens
+        seq_lens = seq_lens_src.tolist()
         rows: List[int] = []
         values: List[int] = []
         for i, req_pool_idx in enumerate(req_indices):
             st = self.states.get(int(req_pool_idx))
             if st is not None and st.req is not None:
-                # logical_position() counts all tokens seen so far INCLUDING the
-                # token being decoded this step (it was appended to output_ids
-                # when it was sampled), so the current token's 0-based rotary
-                # position is that count minus one — for an un-compacted request
-                # this equals the baseline clamp_position(seq_lens) = seq_lens-1.
+                # Physical position of the token decoded this step is
+                # seq_lens[i] - 1; adding every token evicted so far recovers the
+                # logical rotary position. For an un-compacted request
+                # total_evicted == 0, so this is the baseline seq_lens - 1.
+                pos = int(seq_lens[i]) - 1 + st.total_evicted
                 rows.append(i)
-                values.append(self.logical_position(st.req) - 1)
+                values.append(pos if pos > 0 else 0)
         if rows:
             positions = forward_batch.positions
             idx = torch.tensor(rows, device=positions.device, dtype=torch.long)

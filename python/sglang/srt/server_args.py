@@ -2997,8 +2997,7 @@ class ServerArgs:
 
         See R-KV/doc/DESIGN.md: R-KV physically frees KV slots mid-generation,
         which is incompatible with prefix caching (the radix tree would keep
-        references into freed slots), page_size > 1 (per-slot free), and overlap
-        scheduling (phase 1).
+        references into freed slots) and page_size > 1 (per-slot free).
 
         Tensor parallelism (tp > 1) IS supported: each rank scores only its local
         KV heads, so the per-token eviction score is all-reduced across the
@@ -3006,6 +3005,15 @@ class ServerArgs:
         so every rank keeps the identical tokens. DP attention is NOT supported
         (its padded / all-gathered forward_batch layout is untested against the
         R-KV hooks).
+
+        Overlap scheduling IS supported ("Design A"): a decode batch whose forward
+        prepares a compaction is de-overlapped in ``Scheduler.event_loop_overlap``
+        (its commit — tail free + req_to_token rewrite + length shrink — is applied
+        before the next batch is built) so the next batch sees the compacted
+        mapping/length; every other decode step stays overlapped. Positions are
+        derived from ``seq_lens + total_evicted`` (not len(output_ids), which lags
+        a step under overlap). See RKVCompressor.has_pending_commits /
+        commit_compactions / override_decode_positions.
 
         Decode CUDA graph IS supported: a per-step hook
         (``RKVCompressor.begin_decode_step``) advances the compaction counters
@@ -3021,17 +3029,9 @@ class ServerArgs:
                 "--enable-rkv requires --disable-radix-cache: R-KV frees KV "
                 "slots that the radix/prefix cache would still reference."
             )
-        if not self.disable_overlap_schedule:
-            # EXPERIMENT (branch experiment/overlap-decode-rkv): decode R-KV moved
-            # the compaction free() out of the forward into commit_compactions()
-            # at the scheduler-synced result-processing point, so the original
-            # free-on-forward-stream vs overlap-alloc-on-default-stream race
-            # should no longer apply. Allow overlap to STRESS-TEST that claim.
-            # NOT for production until validated at scale.
-            logger.warning(
-                "[EXPERIMENT] --enable-rkv with overlap schedule ENABLED "
-                "(overlap-safety of two-phase compaction is under test)."
-            )
+        # Overlap scheduling is supported via Design A (see the docstring and
+        # Scheduler.event_loop_overlap): compaction steps are de-overlapped so the
+        # commit lands before the next batch is built. No gating needed.
         if self.page_size not in (None, 1):
             raise ValueError("--enable-rkv requires --page-size 1 (per-slot free).")
         if self.enable_dp_attention:

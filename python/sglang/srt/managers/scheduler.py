@@ -1578,6 +1578,27 @@ class Scheduler(
 
             self._apply_war_barrier()
 
+            # R-KV Design A: de-overlap ONLY the compaction steps. A decode batch
+            # whose forward prepared a KV compaction must have its commit (tail
+            # free + req_to_token rewrite + physical length shrink) applied BEFORE
+            # the next batch is built, so the next batch is constructed against
+            # the compacted mapping/length — exactly as in the non-overlap loop.
+            # We therefore drain the last batch's result now, before
+            # get_next_batch_to_run (the existing disable-overlap pop below runs
+            # AFTER the build, which is too late for R-KV: the build already
+            # consumed the stale length). Compaction cadence is deterministic
+            # (every buffer_size steps once seq_len >= budget), so this fires on a
+            # small, predictable fraction of steps; every other decode step stays
+            # fully overlapped.
+            rkv_early_committed = False
+            if (
+                self.rkv_compressor is not None
+                and self.result_queue
+                and self.rkv_compressor.has_pending_commits()
+            ):
+                pop_and_process()
+                rkv_early_committed = True
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1585,7 +1606,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not rkv_early_committed:
                 pop_and_process()
 
             # Launch the current batch
@@ -1597,7 +1618,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not rkv_early_committed:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
