@@ -106,7 +106,7 @@ python3 -m sglang.launch_server \
   --attention-backend flashinfer \
   --enable-rkv \
   --rkv-config '{"budget": 512, "window_size": 8, "buffer_size": 16, "mix_lambda": 0.1}' \
-  --disable-radix-cache --disable-overlap-schedule --page-size 1
+  --disable-radix-cache --page-size 1
 ```
 
 ## Parameters
@@ -134,10 +134,16 @@ frees KV slots mid-generation:
 
 - `--disable-radix-cache` — R-KV frees KV slots the prefix cache would still
   reference.
-- `--disable-overlap-schedule`, `--page-size 1` — phase-1 simplifications.
-- `--tp-size 1` — tensor parallelism is not yet supported (plain data
-  parallelism `--dp-size N --tp-size 1` **is** supported; see
-  [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)).
+- `--page-size 1` — per-slot free (R-KV evicts individual tokens).
+
+**Overlap scheduling is supported** (and left ON by default): R-KV de-overlaps
+only the compaction steps — the scheduler applies a compacting batch's commit
+before building the next batch, so the next batch sees the compacted
+mapping/length, while every other decode step stays fully overlapped ("Design
+A"). **Tensor parallelism** (`--tp-size N`, cross-rank score all-reduce) and
+plain **data parallelism** (`--dp-size N --tp-size 1`) are both supported and
+validated; only `--enable-dp-attention` is rejected (see
+[`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)).
 
 **Decode CUDA graph is supported** (and recommended): a per-step hook forces the
 `window_size` steps ending at each compaction — plus the compaction step — to run

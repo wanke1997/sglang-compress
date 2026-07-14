@@ -33,9 +33,11 @@ Key commits (this line of work):
 - `43a41c131` **compression-aware admission** for prompt-phase (R-KV-prefill)
 - `fe1b26d29` **re-gate overlap off** for prompt-phase (allocator race fix)
 
-Constraints (both R-KV modes): `--disable-radix-cache`,
-`--disable-overlap-schedule`, `--page-size 1`, `tp==1` (R-KV-prefill also needs
-`--disable-prefill-cuda-graph`). Decode CUDA graph **is** supported and stays on.
+Constraints: `--disable-radix-cache`, `--page-size 1` (both modes). Decode R-KV
+(`--enable-rkv`) additionally supports **overlap scheduling** (Design A — §2.7)
+and **tensor parallelism**; prompt-phase R-KV (`--enable-rkv-prefill`) still needs
+`--disable-overlap-schedule`, `tp==1`, and `--disable-prefill-cuda-graph`. Decode
+CUDA graph **is** supported and stays on for both.
 
 ---
 
@@ -87,14 +89,43 @@ O(n²) prefill scoring. **R-KV wins on throughput only when memory-bound.**
   `kv_allocator.free()` does `free_pages = cat(free_pages, freed)` on that
   stream, while overlap's next-batch `alloc()` reads `free_pages` on the default
   stream without waiting → torn read → garbage slot indices → CUDA illegal
-  memory access. Same reason decode R-KV requires overlap off. Re-gated
-  (`fe1b26d29`); fails fast at startup now.
+  memory access. This still gates **prompt-phase** R-KV (`--enable-rkv-prefill`).
+  **Decode R-KV (`--enable-rkv`) now supports overlap** — see §2.7. Re-gated for
+  prompt-phase (`fe1b26d29`); fails fast at startup there.
 
 ### 2.6 CUDA graph
 Decode graph works for both R-KV modes (logical rotary positions restored at
 ForwardBatch construction; decode R-KV uses a hybrid eager/graph). Prefill
 graph must stay off (prompt-phase scoring/compaction are dynamic shapes) and it
 gives ~0% benefit on long prompts anyway (compute-bound).
+
+### 2.7 Overlap for decode R-KV — solved (Design A)
+Decode R-KV (`--enable-rkv`) now runs with overlap scheduling **ON**. The earlier
+corruption had three root causes: (1) the scheduler could build the next batch
+before a compaction's commit (physical-length shrink + `req_to_token` rewrite)
+was applied, so the next forward ran against a stale mapping/length; (2)
+`override_decode_positions` derived the rotary position from `len(output_ids)`,
+which lags one step under overlap (the sampled token is relayed via `future_map`
+and only appended in `process_batch_result`); (3) the tail `free()` could race an
+in-flight relocation. Fixes:
+- **De-overlap only the compaction steps.** A decode batch whose forward prepared
+  a compaction has its commit applied before the next batch is built
+  (`RKVCompressor.has_pending_commits` + the top-of-loop drain in
+  `Scheduler.event_loop_overlap`); every non-compaction step stays fully
+  overlapped. Compaction cadence is deterministic (every `buffer_size` steps once
+  `seq_len ≥ budget`), so this fires on a small, predictable fraction of steps.
+- **Positions from `seq_lens + total_evicted`** (a per-request cumulative
+  eviction counter) instead of `len(output_ids)` — forward-time-correct under
+  overlap, and identical to the old value in the non-overlap path.
+- **Device-sync before the compaction free**, covering the rare case where a
+  finished request is carried one extra decode step and compacts.
+
+Validated on Qwen2.5-Math-7B (5-shot GSM8K, H100): overlap ON matches overlap OFF
+accuracy (e.g. cc=96 n=500 both **0.884**; cc=32 n=200 0.910 vs 0.900) with
+**zero pool leaks / CUDA faults / invariant raises**, at tp=1 and tp=2, budgets
+128–256, buffer 8–256. Throughput: **+2–7%** on a single card (largest where
+compaction is infrequent, e.g. **+7% at budget=buffer=256**; ~+2–3% at
+buffer=16). Prompt-phase overlap (§2.5 / P4) is still gated off.
 
 ---
 
@@ -149,12 +180,14 @@ longer than the pool, but requires decoupling chunked-prefill's
 `len(prefix_indices) == logical processed len` invariant (touches core prefill).
 High value for very-long-context; hard.
 
-### P4 — Async-safe overlap (re-enable overlap for prompt-phase)  ← low priority
-Proper fix for §2.5: defer the compaction `free()` out of the forward to the
-scheduler's synced default-stream point (like `cache_finished_req`) — plumb the
-freed slots from the compressor to the scheduler. Then remove the overlap guard.
-Low priority: benefit is only ~2–5% at scale on the prefill-bound workload, and
-it needs expensive large-scale race re-validation.
+### P4 — Async-safe overlap for prompt-phase R-KV  ← low priority
+**Decode R-KV overlap is DONE** (§2.7, Design A). Remaining: prompt-phase R-KV
+(`--enable-rkv-prefill`) still runs overlap-off. The two-phase compaction split
+(prepare in the forward, `free()` at the scheduler's synced point) plus the
+de-overlap of compaction steps that unblocked decode apply here too; port them to
+`prefill_integration.py` and remove the prompt-phase overlap guard. Low priority:
+benefit is only ~2–5% at scale on the prefill-bound workload, and it needs
+expensive large-scale race re-validation.
 
 ### P5 — Admission refinements
 - Chunked-prefill reservation is currently conservative (only the non-chunked
@@ -177,7 +210,9 @@ some budgets).
 ---
 
 ## 4. Known limitations / gotchas
-- Overlap OFF is **required** for both R-KV modes (allocator race — §2.5).
+- Overlap OFF is **required** for prompt-phase R-KV (`--enable-rkv-prefill`) only
+  (allocator race — §2.5). Decode R-KV (`--enable-rkv`) **supports overlap**
+  (Design A — §2.7).
 - `--ignore-eos` is required for clean throughput A/B (EOS confound — §2.4).
 - Repro of the overlap race needs the real scale (30B, dp=8, async);
   `CUDA_LAUNCH_BLOCKING=1` and small models **hide** it (serialization).

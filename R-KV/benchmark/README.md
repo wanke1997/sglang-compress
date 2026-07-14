@@ -65,8 +65,12 @@ R-KV **requires** a specific server configuration, and the benchmark encodes it:
   would still reference; leaving radix on double-counts the pool and crashes the
   server's leak checker at idle. R-KV and prefix caching are fundamentally
   incompatible (prefix reuse assumes KV is immutable; R-KV evicts it).
-- **`--disable-overlap-schedule`, `--page-size 1`** — phase-1 simplifications
-  (simple timing; per-slot free is clean at page_size=1).
+- **`--page-size 1`** — per-slot free is clean at page_size=1.
+- **`--disable-overlap-schedule`** — the benchmark pins overlap OFF so the R-KV
+  vs Full-KV timing comparison is a controlled A/B. Decode R-KV **supports
+  overlap** now (it de-overlaps only the compaction steps; enabling it adds ~2–7%
+  throughput on a single card) — it is left off here only for the equal-flags
+  comparison.
 
 **Decode CUDA graph is supported** (hybrid path, and left ON): the `window_size`
 steps ending at each compaction — plus the compaction step — run eager, while

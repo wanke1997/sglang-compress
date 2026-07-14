@@ -181,9 +181,12 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
 5. **No startup validation of R-KV-incompatible flags (owner review, 2026-07-02).**
    `--enable-rkv` silently corrupted the KV pool when combined with the radix
    cache, overlap scheduling, `page_size > 1`, or `tp > 1`. Fix:
-   `ServerArgs._handle_rkv_validation` now rejects those combos at startup with an
-   explicit error. (Decode CUDA graph was **later made compatible** via the
-   hybrid eager/graph path and is no longer rejected.)
+   `ServerArgs._handle_rkv_validation` now rejects the truly-incompatible combos
+   (radix cache, `page_size > 1`, `--enable-dp-attention`) at startup with an
+   explicit error. (Overlap scheduling, tensor parallelism, and decode CUDA graph
+   were all **later made compatible** — overlap via the Design-A de-overlap of
+   compaction steps, tp via the cross-rank score all-reduce, CUDA graph via the
+   hybrid eager/graph path — and are no longer rejected.)
 
 ## 9. Environment (dev-v0.5.14 needs a newer stack than v0.5.3-era wheels)
 
@@ -195,18 +198,21 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
 
 ## 10. Running & validation
 
-Launch (required flags — radix cache off so R-KV can free slots, overlap off,
-`page_size=1` for clean slot free). **Decode CUDA graph is supported and left on**
-via the hybrid eager/graph path (the `window_size` steps ending at each
-compaction, plus the compaction step, run eager; every other decode step replays
-the captured graph). Pass `--disable-decode-cuda-graph` only if you want the
-fully-eager path:
+Launch (required flags — radix cache off so R-KV can free slots, `page_size=1`
+for clean slot free). **Overlap scheduling and decode CUDA graph are both
+supported and left on.** Overlap uses the Design-A de-overlap of compaction steps
+(a compacting batch's commit is applied before the next batch is built, so the
+next batch sees the compacted mapping/length; every other decode step stays
+overlapped). CUDA graph uses the hybrid eager/graph path (the `window_size` steps
+ending at each compaction, plus the compaction step, run eager; every other
+decode step replays the captured graph). Pass `--disable-overlap-schedule` /
+`--disable-decode-cuda-graph` only for the simpler serial / fully-eager paths:
 
 ```bash
 PYTHONPATH=$PWD/python HF_HUB_DISABLE_XET=1 python3 -m sglang.launch_server \
   --model-path /data/model/Qwen2.5-0.5B-Instruct \
   --attention-backend flashinfer \
-  --disable-radix-cache --disable-overlap-schedule --page-size 1 \
+  --disable-radix-cache --page-size 1 \
   --enable-rkv --rkv-config '{"budget":64,"window_size":8,"buffer_size":16}' \
   --mem-fraction-static 0.6 --host 127.0.0.1 --port 30000
 ```
@@ -337,9 +343,10 @@ hooks, so the startup guard still rejects it.
 > **Enforced at startup:** `ServerArgs._handle_rkv_validation` allows
 > `--enable-rkv` with `--tp > 1` (the §11.2 cross-rank score all-reduce keeps
 > every rank's `kept` set identical) but still rejects `--enable-dp-attention`,
-> radix cache, overlap schedule, and `page_size > 1`. Decode CUDA graph is
-> supported and may stay enabled. Plain DP (`--dp-size N --tp-size 1`) is allowed
-> and validated (§11.3).
+> radix cache, and `page_size > 1`. Overlap scheduling and decode CUDA graph are
+> both supported and may stay enabled (overlap via the Design-A de-overlap of
+> compaction steps). Plain DP (`--dp-size N --tp-size 1`) is allowed and
+> validated (§11.3).
 
 ## 12. Other limitations / next
 
