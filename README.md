@@ -57,8 +57,8 @@ the captured graph), so it stays enabled. See
 [`R-KV/benchmark/README.md`](R-KV/benchmark/README.md) for details and
 [`R-KV/benchmark/RESULTS.md`](R-KV/benchmark/RESULTS.md) for the 0.5B sanity check.
 
-For multi-GPU **data-parallel** serving (`DP=N ./launch_server.sh rkv 512`),
-throughput scales up to **5.2× on 8× H100** with unchanged accuracy — see
+For multi-GPU **data-parallel** serving (`DP=N ./launch_server.sh rkv 256`),
+throughput scales up to **7.8× on 8× H100** with unchanged accuracy — see
 [`R-KV/benchmark/RESULTS_dp.md`](R-KV/benchmark/RESULTS_dp.md).
 
 ---
